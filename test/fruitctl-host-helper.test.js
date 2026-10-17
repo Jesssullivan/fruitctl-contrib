@@ -81,7 +81,9 @@ function native({ health = {}, run, releaseError, releaseRun, adopt, capabilitie
   };
 }
 
-function helper({ alter, ignoreTerm = false, ignoreKill = false } = {}) {
+// latency(request) delays each reply as a real SSH-attached Host would; a
+// serial Host answers one request at a time in arrival order.
+function helper({ alter, ignoreTerm = false, ignoreKill = false, latency, serial = false, pipelining } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.exitCode = null; child.signalCode = null; child.kills = [];
@@ -99,12 +101,27 @@ function helper({ alter, ignoreTerm = false, ignoreKill = false } = {}) {
     capture_enabled: true, screen_capture_permission: true, raw_vnc_exclusion: false,
     display_id: 42, displayGeneration: 7, renewal_interval_ms: 500,
     input_permit_ms: 1000, maximum_round_trip_ms: 500,
+    ...(pipelining === undefined ? {} : { request_pipelining: pipelining }),
     capture_ready: Boolean(owner), overlay_ready: Boolean(owner), ready: Boolean(owner),
     ui_heartbeat_age_ms: owner ? 0 : null, lease_remaining_ms: owner ? 3000 : 0,
     ...(owner || {}) });
+  let busyUntil = 0;
   child.stdin = new Writable({ write(bytes, encoding, callback) {
     const request = JSON.parse(bytes.toString());
     requests.push(request);
+    if (latency) {
+      request.sentAt = performance.now();
+      const start = serial ? Math.max(request.sentAt, busyUntil) : request.sentAt;
+      const done = start + latency(request);
+      if (serial) busyUntil = done;
+      setTimeout(() => { request.answeredAt = performance.now(); answer(request); }, done - request.sentAt);
+      callback();
+      return;
+    }
+    callback();
+    answer(request, true);
+  } });
+  function answer(request, deferred = false) {
     if (request.action === 'begin_activity' || request.action === 'renew_activity') {
       owner = { session_id: request.params.session_id, sequence: request.params.sequence,
         challenge: request.params.challenge };
@@ -115,9 +132,10 @@ function helper({ alter, ignoreTerm = false, ignoreKill = false } = {}) {
       display_bounds: bounds, pixels_per_point_x: 2, pixels_per_point_y: 2, cursor_included: true };
     let response = { id: request.id, success: true, result };
     if (alter) response = alter(request, response);
-    callback();
-    if (response !== null) queueMicrotask(() => child.stdout.write(JSON.stringify(response) + '\n'));
-  } });
+    if (response === null) return;
+    if (deferred) queueMicrotask(() => child.stdout.write(JSON.stringify(response) + '\n'));
+    else child.stdout.write(JSON.stringify(response) + '\n');
+  }
   return { child, requests, launches, state, spawnImpl(command, args, options) {
     launches.push({ command, args, options }); return child;
   } };
@@ -377,6 +395,26 @@ test('broker keeps release-unconfirmed and sanitized capture cause with partial 
       assert.deepEqual(vnc.calls.map(action => action.action), kind === 'command' ? [] : ['wait']);
     });
   }
+});
+
+test('a local helper deadline is named as the cause of an unconfirmed release', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-host-deadline-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const { executor } = await fixture({ helperOptions: { alter(request, response) {
+    return request.action === 'renew_activity' ? null : response;
+  } } });
+  const socketPath = path.join(directory, 'broker.sock');
+  const broker = await createBroker({ socketPath, config: { targets: { desktop: {} } },
+    factory: async () => executor });
+  t.after(() => assert.rejects(broker.close(), error => error.code === 'release_unconfirmed'));
+  const client = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => client.close());
+  await client.opened;
+  const result = await new McpSession(client).command({ action: 'screenshot' });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, 'Error: Target input release is unconfirmed; reconcile the target ' +
+    'before restarting its broker; cause=Host-helper receipt deadline exceeded');
 });
 
 test('configured helper screenshots use owned SCK PNG and retain ownership indication, never raw VNC', async () => {
@@ -924,6 +962,42 @@ test('lost helper transport invalidates all future input without reconnect or re
   assert.deepEqual(vnc.calls, []);
   assert.equal(vnc.closes.length, 1);
   assert.equal(host.launches.length, 1);
+});
+
+test('measured SSH latency: a slow connect and 1.6 s captures complete with input still lease-bound', async t => {
+  // Live PZM over SSH: first reply 0.5-0.9 s, warm replies ~5 ms, a 1080p
+  // capture 1-2 s (PNG encode and transfer, not ScreenCaptureKit).
+  let first = true;
+  const latency = request => {
+    if (first) { first = false; return 900; }
+    return request.action === 'capture' ? 1600 : 5;
+  };
+  for (const pipelining of [false, true]) {
+    await t.test(pipelining ? 'pipelining Host renews beside the capture' : 'serial Host lapses, then re-arms', async () => {
+      first = true;
+      const { executor, vnc, host } = await fixture({ config: { ...configuration(), mapping },
+        helperOptions: { latency, serial: !pipelining, pipelining } });
+      assert.ok(host.requests[0].answeredAt - host.requests[0].sentAt >= 850);
+      try {
+        const responses = await executor.execute([{ action: 'screenshot' }, { action: 'mouse_click', x: 4, y: 4 }]);
+        assert.equal(responses.length, 2);
+        assert.ok(responses[0].result.image);
+        assert.deepEqual(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+        const captures = host.requests.filter(request => request.action === 'capture');
+        assert.equal(captures.length, 2);
+        const renewals = host.requests.filter(request => request.action === 'renew_activity');
+        const during = renewals.filter(renewal => captures.some(capture =>
+          renewal.sentAt > capture.sentAt && renewal.sentAt < capture.answeredAt));
+        if (pipelining) assert.ok(during.length >= 4, `renewals during captures: ${during.length}`);
+        else assert.equal(during.length, 0);
+        // Input follows a renewal answered after the last capture finished.
+        const last = captures.at(-1).answeredAt;
+        assert.ok(renewals.some(renewal => renewal.sentAt >= last && renewal.answeredAt));
+        assert.equal(executor.permitLapsedAt, undefined);
+        assert.equal(executor.presentation.indicator, 'present');
+      } finally { await executor.close(); }
+    });
+  }
 });
 
 test('500ms renewal deadline cancels an in-flight native command on helper stall', async () => {

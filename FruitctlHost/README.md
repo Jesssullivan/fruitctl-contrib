@@ -228,11 +228,19 @@ observer registration. No private screen-lock notifications or TCC bypasses are
 used; lock-screen behavior remains an attended qualification case.
 
 The helper-backed broker challenges every 500 ms during activity and rejects
-acknowledgements whose challenge round trip exceeds 500 ms. The native writer
+lease acknowledgements whose challenge round trip exceeds 500 ms. Two requests
+have longer deadlines: the first `health`, which also pays SSH connection setup
+(5 s), and `capture`/`ax_snapshot`, which carry an encoded image or tree (3 s,
+just above this app's own 2.5 s per-request limit). The native writer
 starts its own monotonic challenge deadline before helper renewal, validates
 session and VNC/display bindings, and admits no new input event more than
 1,000 ms after that native challenge. No remote timestamp extends this deadline;
-expiry is terminal for the owned episode. Held-state neutralization may follow
+expiry is terminal for the owned episode, with one exception. A Host that answers
+one request at a time cannot renew while it encodes a capture. A permit that
+expires during that observation lapses instead: input stays refused, and only a
+renewal sent after the lapse can re-arm it, within 1 s or the episode ends. A
+Host whose health reports `request_pipelining: true` keeps renewing beside a
+capture, and for it any expiry stays terminal. Held-state neutralization may follow
 expiry, and an already blocked native send remains outside the responsive-writer
 proof. Uncertain input is never replayed. The 250 ms input-chunk and 2-second
 action values are design targets; current source allows longer actions under the
