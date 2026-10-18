@@ -468,7 +468,9 @@ mapping receipt, treat it as an unqualified preview.
 
 Current Host source obtains one `CMSampleBuffer` from
 `SCScreenshotManager.captureSampleBuffer`, copies its bounded BGRA pixels into
-owned storage and encodes the PNG from that copy. The accompanying
+owned storage and encodes the requested image from that copy: PNG when the
+request names no `format`, or JPEG at quality 0.85 for model-facing frames
+(D38). The accompanying
 `native_frame_timing` metadata retains that sample's presentation time, optional
 WindowServer display time, and separate request/completion brackets from the
 CoreMedia host clock. Integer timestamp values and epochs are decimal strings
