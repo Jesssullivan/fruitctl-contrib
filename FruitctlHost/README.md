@@ -260,7 +260,10 @@ requests have other deadlines:
 
 - The first `health` also pays SSH connection setup: 5 s.
 - `begin_activity` takes an excluded-app snapshot and shows the indicator
-  before it answers: 2 s.
+  before it answers: 2 s. Its permit still starts at the send, so a begin
+  that leaves less of it than the first heartbeat needs is followed at once
+  by a renewal. A begin answered after its whole 1 s window admits the owner
+  with input refused until that renewal arms it.
 - `capture` and `ax_snapshot` carry an encoded image or tree. The reply must
   start within 3 s and keep arriving with no gap over 3 s, up to 20 s. Only
   that reply's own bytes count, so a stalled reply cannot be kept alive by

@@ -1092,6 +1092,37 @@ test('slow link: a split capture keeps arriving past 3 s while renewals pass bet
   });
 });
 
+test('a slow cold begin renews before the first heartbeat; a spent window arms only from that renewal', async t => {
+  // Live PZM: begin_activity takes ~0.5 s at the Host, ~0.65 s over a 147 ms
+  // link, leaving too little of its 1 s permit for the first heartbeat.
+  const slow = begin => request => request.action === 'begin_activity' ? begin : 150;
+  for (const [pipelining, begin] of [[false, 650], [true, 650], [true, 1200]]) {
+    await t.test(`${pipelining ? 'pipelining' : 'serial'} Host, ${begin} ms begin`, async () => {
+      const { executor, vnc, host } = await fixture({ config: { ...configuration(), mapping },
+        helperOptions: { latency: slow(begin), serial: !pipelining, pipelining } });
+      try {
+        await executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]);
+        await new Promise(resolve => setTimeout(resolve, 700));
+        assert.equal(executor.failed, undefined);
+        assert.deepEqual(host.requests.slice(1, 3).map(request => request.action),
+          ['begin_activity', 'renew_activity']);
+        assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+      } finally { await executor.close(); }
+    });
+  }
+  await t.test('a spent begin whose renewal never answers sends no input and retires', async () => {
+    const { executor, vnc } = await fixture({ config: { ...configuration(), mapping }, helperOptions: {
+      latency: slow(1200), pipelining: true,
+      alter: (request, response) => request.action === 'renew_activity' ? null : response } });
+    try {
+      await assert.rejects(executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]),
+        /receipt deadline|permit expired/);
+      assert.ok(executor.failed);
+      assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 0);
+    } finally { await executor.close(); }
+  });
+});
+
 test('500ms renewal deadline cancels an in-flight native command on helper stall', async () => {
   const config = { ...configuration(), mapping };
   const { executor, vnc, host } = await fixture({ config, helperOptions: {
