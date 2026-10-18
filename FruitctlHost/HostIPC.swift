@@ -175,15 +175,30 @@ private final class HostReplyWaiter {
 
 /// One connection's whole-line writer. A failure shuts the socket down, which
 /// ends the reader; the descriptor itself is closed only by serve().
+///
+/// Lines go out in the order their writers arrived. A renewal reply that
+/// arrives while one image part is being written goes out before the next
+/// part. A plain lock gives no such order: Darwin mutexes let the thread that
+/// releases one take it straight back, so a parts loop could hold every
+/// renewal behind the whole image.
 private final class HostConnectionWriter {
     private let fd: Int32
-    private let writeLock = NSLock()
+    private let turn = NSCondition()
+    private var nextTicket: UInt64 = 0
+    private var serving: UInt64 = 0
     private let stateLock = NSLock()
     private var isFailed = false
     init(fd: Int32) { self.fd = fd }
     var failed: Bool { stateLock.lock(); defer { stateLock.unlock() }; return isFailed }
     func write(_ line: Data) throws {
-        writeLock.lock(); defer { writeLock.unlock() }
+        turn.lock()
+        let ticket = nextTicket
+        nextTicket &+= 1
+        while ticket != serving { turn.wait() }
+        turn.unlock()
+        // Each write is bounded by its stall deadline, and abandon() shuts the
+        // socket down, so a waiting writer always gets its turn.
+        defer { turn.lock(); serving &+= 1; turn.broadcast(); turn.unlock() }
         guard !failed else { throw HostIPCError.unavailable }
         try HostIPC.write(line, to: fd)
     }
