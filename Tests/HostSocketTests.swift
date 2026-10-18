@@ -208,6 +208,75 @@ final class HostSocketTests: XCTestCase {
         XCTAssertEqual(fixture.persisted, 1)
     }
 
+    func testRenewalIsAnsweredWhileACaptureOnTheSameConnectionIsPending() async throws {
+        // A slow capture (PNG encode) must not queue the lease renewal behind it.
+        let root = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath()
+            .appendingPathComponent(".local/state/fctl-sock-" + String(UUID().uuidString.prefix(8)))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let held = NSLock()
+        var heldReply: ((HostResponse) -> Void)?
+        var heldRequest: HostRequest?
+        let server = HostSocketServer(path: root.appendingPathComponent("s").path,
+            handler: { request, _, reply in
+                if request.action == "capture" {
+                    held.lock(); heldRequest = request; heldReply = reply; held.unlock()
+                } else { reply(.ok(request, ["answered": .string(request.action)])) }
+            }, disconnected: { _ in })
+        try server.start()
+        defer { server.stop() }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        HostIPC.configure(fd)
+        var address = try HostIPC.address(root.appendingPathComponent("s").path)
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        XCTAssertEqual(connected, 0)
+        for (id, action) in [("capture", "capture"), ("renew", "renew_activity")] {
+            let body: [String: Any] = ["action": action, "id": id, "params": [String: String]()]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            try HostIPC.write(data + Data([10]), to: fd)
+        }
+        let first = try response(fd)
+        XCTAssertEqual(first["id"] as? String, "renew")
+        held.lock(); let reply = heldReply, request = heldRequest; held.unlock()
+        let pending = try XCTUnwrap(request)
+        reply?(.ok(pending, ["answered": .string("capture")]))
+        let second = try response(fd)
+        XCTAssertEqual(second["id"] as? String, "capture")
+    }
+
+    func testLargeImageReplySplitsIntoPartsOnlyWhenRequested() throws {
+        let request = try JSONDecoder().decode(HostRequest.self, from: Data(
+            #"{"action":"capture","id":"c","params":{"reply_part_bytes":16384}}"#.utf8))
+        let image = String(repeating: "QUJD", count: 10_000)
+        let response = HostResponse.ok(request, ["image": .string(image), "ready": .boolean(true)])
+        let lines = try response.lines(partBytes: HostResponse.requestedPartBytes(request))
+        XCTAssertEqual(lines.count, 4)
+        var joined = ""
+        for (index, line) in lines.dropLast().enumerated() {
+            let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: line) as? [String: Any])
+            XCTAssertEqual(object["id"] as? String, "c")
+            let part = try XCTUnwrap(object["part"] as? [String: Any])
+            XCTAssertEqual(part["index"] as? Int, index)
+            joined += try XCTUnwrap(part["data"] as? String)
+        }
+        XCTAssertEqual(joined, image)
+        let final = try XCTUnwrap(try JSONSerialization.jsonObject(with: lines[3]) as? [String: Any])
+        let result = try XCTUnwrap(final["result"] as? [String: Any])
+        XCTAssertNil(result["image"])
+        XCTAssertEqual(result["image_parts"] as? Int, 3)
+        XCTAssertEqual(result["ready"] as? Bool, true)
+        XCTAssertEqual(try response.lines(partBytes: nil).count, 1)
+        XCTAssertNil(HostResponse.requestedPartBytes(try JSONDecoder().decode(HostRequest.self, from: Data(
+            #"{"action":"capture","id":"c","params":{"reply_part_bytes":12}}"#.utf8))))
+    }
+
     func testWriteDirectionProbeDistinguishesHalfCloseFromFullClose() throws {
         var descriptors: [Int32] = [-1, -1]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)

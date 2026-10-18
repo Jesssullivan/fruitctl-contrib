@@ -109,7 +109,11 @@ also accepts the legacy action field. IDs are strings or integers. Responses
 are `{"id":"request-id","success":true,"result":{...}}`, or
 `{"id":"request-id","success":false,"error":{"code":-32000,"message":"..."}}`.
 Each request is one newline-terminated UTF-8 JSON record, at most 65,536 bytes.
-Each connection is serialized, and at most eight same-user connections attach.
+At most eight same-user connections attach. Each connection may have four
+requests outstanding, answered as each completes, so `renew_activity` is not
+queued behind a capture's encode; `health` reports `request_pipelining: true`.
+Each request must complete within 2.5 s or its connection, and with it the
+connection's lease, ends.
 
 | Action | Parameters and behavior |
 | --- | --- |
@@ -117,7 +121,7 @@ Each connection is serialized, and at most eight same-user connections attach.
 | `begin_activity` | `session_id`, positive integer `sequence`, `challenge`; optional `display_id` must match startup configuration, and `capture_backend` must be `owned_sck`. Reserves this connection's lease, verifies one complete excluded-app screenshot, then shows the indicator and acknowledges. |
 | `renew_activity` | Same session/connection, strictly increasing `sequence`, fresh `challenge`; requires recent main-thread heartbeat and capture/UI readiness. |
 | `release_activity` | `session_id`; releases only this connection's activity and hides the indicator. |
-| `capture` / `screenshot` | `session_id`, optional `max_dimension` (256–4096; default 1280), same configured display. Requires a live ready lease. Returns a complete PNG with image and display mapping metadata. |
+| `capture` / `screenshot` | `session_id`, optional `max_dimension` (256–4096; default 1280), optional `format` (`png` when absent, or `jpeg` at quality 0.85 for model-facing frames, D38), and optional `reply_part_bytes` (16 KiB–1 MiB) to split the image across part lines. Requires the same configured display and a live ready lease. Returns a complete image with `mimeType`, display mapping metadata and `host_stage_ms`. |
 | `ax_snapshot` | `session_id`, optional `depth` (1–12; default 6) and boolean `focused_app` (default `true`: frontmost application only; `false`: every regular visible application). Requires the same live ready lease as capture and the Accessibility grant. Reads the live tree off the main thread within a 200 ms budget, breadth first, at most 1,500 nodes and 200 children per element. Returns readiness plus `ax_snapshot`. |
 | `ax_action` | `session_id`, `generation` (from the latest `ax_snapshot` of this lease), `ref`, `action` (`press` or `focus`), optional boolean `vnc_fallback`. Requires the same live ready lease, the Accessibility grant and no other capture or AX work in flight. Reads the element off the main thread, re-checks the lease, Stop latch and display, then makes exactly one AX call on the main thread: `AXPress` (or `AXShowMenu` for a menu-bar item without it) or `AXFocused` (or `AXRaise` for a window). It then polls the element for up to 250 ms in total. Returns readiness plus `ax_action`. |
 | `ax_verify` | `session_id`, `generation`, `ref`, `action`, matching the one `ax_action` that returned `vnc_click_required`. Consumes that record and polls the element against its pre-click state. Returns readiness plus `ax_verify: {ref, action, generation, verified}`. |

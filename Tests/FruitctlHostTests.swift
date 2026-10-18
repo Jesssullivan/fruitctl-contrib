@@ -679,9 +679,9 @@ final class HostImageProcessingTests: XCTestCase {
     @MainActor
     func testImageProcessingLeavesMainActorFreeForStopAndHeartbeat() async throws {
         let gate = HostImageProcessingTestGate()
-        let processor = HostImageProcessor { image, maximumDimension in
+        let processor = HostImageProcessor { image, maximumDimension, format in
             await gate.hold(startedOnMainThread: Thread.isMainThread)
-            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension)
+            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension, format: format)
         }
         let owned = try image()
         let parent = Task { @MainActor in
@@ -717,9 +717,9 @@ final class HostImageProcessingTests: XCTestCase {
     @MainActor
     func testImageProcessingCancellationRetainsWorkerUntilActualCompletion() async throws {
         let gate = HostImageProcessingTestGate()
-        let processor = HostImageProcessor { image, maximumDimension in
+        let processor = HostImageProcessor { image, maximumDimension, format in
             await gate.hold(startedOnMainThread: Thread.isMainThread)
-            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension)
+            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension, format: format)
         }
         let owned = try image()
         let parent = Task { @MainActor in
@@ -748,9 +748,9 @@ final class HostImageProcessingTests: XCTestCase {
     @MainActor
     func testImageProcessingRejectsPreCanceledParentWithoutStartingWorker() async throws {
         let gate = HostImageProcessingTestGate()
-        let processor = HostImageProcessor { image, maximumDimension in
+        let processor = HostImageProcessor { image, maximumDimension, format in
             await gate.hold(startedOnMainThread: Thread.isMainThread)
-            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension)
+            return try HostImageEncoder.encode(image, maximumDimension: maximumDimension, format: format)
         }
         let owned = try image()
         let parent = Task { @MainActor in
@@ -769,9 +769,9 @@ final class HostImageProcessingTests: XCTestCase {
         let owned = try image()
         for changed in 0..<3 {
             let gate = HostImageProcessingTestGate()
-            let processor = HostImageProcessor { image, maximumDimension in
+            let processor = HostImageProcessor { image, maximumDimension, format in
                 await gate.hold(startedOnMainThread: Thread.isMainThread)
-                return try HostImageEncoder.encode(image, maximumDimension: maximumDimension)
+                return try HostImageEncoder.encode(image, maximumDimension: maximumDimension, format: format)
             }
             var granted = true, enabled = true, displayMatches = true
             let permission = HostCapturePermission(preflight: { granted }, request: { false })
@@ -797,18 +797,29 @@ final class HostImageProcessingTests: XCTestCase {
     }
 
     @MainActor
+    func testJPEGFrameKeepsTheRequestedScaledGeometry() async throws {
+        let processor = HostImageProcessor()
+        let encoded = try await processor.process(image(), maximumDimension: 2, format: .jpeg)
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(encoded.encoded as CFData, nil))
+        XCTAssertEqual(CGImageSourceGetType(source) as String?, "public.jpeg")
+        let decodedImage = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        XCTAssertEqual(decodedImage.width, encoded.scaledWidth)
+        XCTAssertEqual(decodedImage.height, encoded.scaledHeight)
+    }
+
+    @MainActor
     func testImageProcessingPreservesOwnedPNGPixelsAndScaling() async throws {
         let processor = HostImageProcessor()
         let patterned = try image()
         let full = try await processor.process(patterned, maximumDimension: 8)
-        let fullImage = try decoded(full.png)
+        let fullImage = try decoded(full.encoded)
         XCTAssertEqual(full.scaledWidth, 4)
         XCTAssertEqual(full.scaledHeight, 2)
         XCTAssertEqual(fullImage.width, full.scaledWidth)
         XCTAssertEqual(fullImage.height, full.scaledHeight)
         XCTAssertEqual(try rgba(fullImage), try rgba(patterned))
         let scaled = try await processor.process(image(solid: true), maximumDimension: 2)
-        let scaledImage = try decoded(scaled.png)
+        let scaledImage = try decoded(scaled.encoded)
         XCTAssertEqual(scaled.scaledWidth, 2)
         XCTAssertEqual(scaled.scaledHeight, 1)
         XCTAssertEqual(scaledImage.width, scaled.scaledWidth)

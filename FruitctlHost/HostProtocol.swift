@@ -99,12 +99,52 @@ struct HostResponse: Encodable {
                      error: RPCError(code: code, message: message, data: data))
     }
 
-    func line() throws -> Data {
+    func line() throws -> Data { try Self.encodeLine(self) }
+
+    private static func encodeLine<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        var data = try encoder.encode(self)
+        var data = try encoder.encode(value)
         data.append(10)
         return data
+    }
+
+    /// Reply parts are opt-in per request (`reply_part_bytes`), and only for
+    /// an `image` string. They change framing, never the image encoding.
+    static let partByteRange = 16_384...1_048_576
+
+    static func requestedPartBytes(_ request: HostRequest) -> Int? {
+        guard let bytes = request.params["reply_part_bytes"]?.integer, partByteRange.contains(bytes) else {
+            return nil
+        }
+        return bytes
+    }
+
+    private struct Part: Encodable {
+        let id: HostValue?
+        let part: Slice
+        struct Slice: Encodable { let index: Int; let data: String }
+    }
+
+    /// `{"id","part":{"index","data"}}` lines carry consecutive slices of the
+    /// result's ASCII `image`; the final reply omits `image` and names the
+    /// part count as `image_parts`.
+    func lines(partBytes: Int?) throws -> [Data] {
+        guard let partBytes, success, var result, let image = result["image"]?.string,
+              image.utf8.count > partBytes, image.utf8.allSatisfy({ $0 < 0x80 }) else { return [try line()] }
+        let bytes = Array(image.utf8)
+        var lines: [Data] = []
+        var offset = 0
+        while offset < bytes.count {
+            let end = min(offset + partBytes, bytes.count)
+            let slice = String(decoding: bytes[offset..<end], as: UTF8.self)
+            lines.append(try Self.encodeLine(Part(id: id, part: .init(index: lines.count, data: slice))))
+            offset = end
+        }
+        result["image"] = nil
+        result["image_parts"] = .integer(Int64(lines.count))
+        lines.append(try Self.encodeLine(HostResponse(id: id, success: true, result: result, error: nil)))
+        return lines
     }
 }
 

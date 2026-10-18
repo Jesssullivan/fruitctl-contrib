@@ -102,7 +102,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             // path. This internal size requests ratio1 without exposing a new
             // unbounded max_dimension to ordinary IPC observations.
             let image = try await self.capture.snapshot(maximumDimension: 16_384)
-            return HostReferenceCapture(png: image.png, metadata: image.geometryMetadata)
+            return HostReferenceCapture(png: image.encoded, metadata: image.geometryMetadata)
         }, connectionLive: { [weak self] connection in
             self?.server?.connectionIsLive(connection) == true
         }, persist: { image, receipt in
@@ -463,6 +463,15 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         }
     }
 
+    /// Absent means PNG, as before D38, so an older broker is unchanged.
+    private func imageFormat(_ request: HostRequest) throws -> HostImageFormat {
+        guard let value = request.params["format"] else { return .png }
+        guard let name = value.string, let format = HostImageFormat(rawValue: name) else {
+            throw HostLeaseError.invalidParameters
+        }
+        return format
+    }
+
     private func maximumDimension(_ request: HostRequest) throws -> Int {
         guard let value = request.params["max_dimension"] else { return 1_280 }
         guard let size = value.integer, (256...4_096).contains(size) else {
@@ -534,6 +543,11 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                                  "release_activity", "export_idle_reference",
                                                  "ax_snapshot", "ax_action"].map { .string($0) })
                 status["input_service"] = .boolean(false)
+                // Requests on one connection are answered as each completes.
+                status["request_pipelining"] = .boolean(true)
+                // Capture and AX replies may be split with reply_part_bytes.
+                status["reply_parts"] = .boolean(true)
+                status["image_formats"] = .array([HostImageFormat.png, .jpeg].map { .string($0.rawValue) })
                 return .ok(request, status)
             case "begin_activity":
                 try validateDisplay(request)
@@ -550,17 +564,21 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 defer { captureInProgress = false }
                 do {
                     // A complete excluded-app image must succeed before UI is shown.
-                    _ = try await capture.snapshot(maximumDimension: 256)
-                    let acknowledgedAt = clock.milliseconds()
+                    let snapshot = try await capture.snapshot(maximumDimension: 256)
+                    let snapshotAt = clock.milliseconds()
                     let current = try lease.requireOwner(sessionID: session, connectionID: connectionID,
-                        displayGeneration: generation, now: acknowledgedAt)
+                        displayGeneration: generation, now: snapshotAt)
                     try requireAvailable()
                     try permission.requireCapture(enabled: capture.enabled)
                     captureReady = true
                     overlayReady = renderer.show()
                     guard overlayReady else { throw HostLeaseError.notReady }
+                    let acknowledgedAt = clock.milliseconds()
                     lastUIHeartbeat = acknowledgedAt
-                    return .ok(request, readiness(now: acknowledgedAt, activity: current))
+                    var stages = snapshot.stageMilliseconds
+                    stages["overlay_show"] = Int64(clamping: acknowledgedAt - snapshotAt)
+                    return .ok(request, readiness(now: acknowledgedAt, activity: current)
+                        .merging(["host_stage_ms": .object(stages.mapValues { .integer($0) })]) { _, value in value })
                 } catch {
                     if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
                     throw error
@@ -591,6 +609,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 try validateDisplay(request)
                 try requireAvailable()
                 let size = try maximumDimension(request)
+                let format = try imageFormat(request)
                 let session = try request.requiredString("session_id")
                 _ = try lease.requireOwner(sessionID: session, connectionID: connectionID,
                                             displayGeneration: generation, now: now)
@@ -602,7 +621,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 captureInProgress = true
                 defer { captureInProgress = false }
                 do {
-                    let image = try await capture.snapshot(maximumDimension: size)
+                    let image = try await capture.snapshot(maximumDimension: size, format: format)
                     let completedAt = clock.milliseconds()
                     let current = try lease.requireOwner(sessionID: session, connectionID: connectionID,
                         displayGeneration: generation, now: completedAt)

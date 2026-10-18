@@ -142,6 +142,10 @@ separately installed resident Host, distinguish these results:
 | Fresh complete images from the configured display | The tested capture route worked for that episode. |
 | Simultaneous human view, agent images and local Stop | Evidence for indicator exclusion and Stop behavior on the tested route. |
 
+A true preflight does not rule out a prompt. On PZM (2026-10-17), macOS showed a Screen Recording
+re-confirmation prompt on the first live capture even though health reported
+`screen_capture_permission: true`. Attend the first Host-route capture on each target.
+
 Capture refusals retain a matched request UUID, stable reason and, for supported
 Apple framework failures, a bounded phase/domain/code diagnostic. Those values
 can help locate a failure without exposing raw Apple error text or private
