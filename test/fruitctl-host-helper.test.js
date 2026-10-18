@@ -1123,6 +1123,19 @@ test('a slow cold begin renews before the first heartbeat; a spent window arms o
   });
 });
 
+test('a serial Host capture after mouse_down retires the owner rather than lapse with the button held', async () => {
+  const latency = request => request.action === 'capture' ? 1600 : 5;
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping },
+    helperOptions: { latency, serial: true, pipelining: false } });
+  try {
+    await assert.rejects(executor.execute([{ action: 'mouse_down', x: 2, y: 3 }, { action: 'screenshot' },
+      { action: 'mouse_up' }]), /permit expired/);
+    assert.deepEqual(vnc.calls.filter(action => action.action.startsWith('mouse_')).map(action => action.action),
+      ['mouse_down']);
+    assert.deepEqual(vnc.closes, [{ graceful: false }]);
+  } finally { await executor.close(); }
+});
+
 test('500ms renewal deadline cancels an in-flight native command on helper stall', async () => {
   const config = { ...configuration(), mapping };
   const { executor, vnc, host } = await fixture({ config, helperOptions: {

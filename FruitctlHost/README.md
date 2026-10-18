@@ -284,6 +284,7 @@ expiry is terminal for the owned episode, with one exception. A Host that answer
 one request at a time cannot renew while it encodes a capture. A permit that
 expires during that observation lapses instead: input stays refused, and only a
 renewal sent after the lapse can re-arm it, within 1 s or the episode ends. A
+batch that has sent `mouse_down` never lapses; expiry retires it, releasing the hold. A
 Host whose health reports `request_pipelining: true` keeps renewing beside a
 capture, and for it any expiry stays terminal. Held-state neutralization may follow
 expiry, and an already blocked native send remains outside the responsive-writer
