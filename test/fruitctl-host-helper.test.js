@@ -40,6 +40,20 @@ function image(width = 256, height = 128, rawPixels) {
     chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]).toString('base64');
 }
 
+// A structurally complete baseline JPEG header and scan for the given size.
+function jpegImage(width = 256, height = 128) {
+  const segment = (marker, body) => {
+    const length = Buffer.alloc(2); length.writeUInt16BE(body.length + 2);
+    return Buffer.concat([Buffer.from([0xff, marker]), length, body]);
+  };
+  const size = Buffer.alloc(4); size.writeUInt16BE(height, 0); size.writeUInt16BE(width, 2);
+  return Buffer.concat([Buffer.from([0xff, 0xd8]),
+    segment(0xdb, Buffer.alloc(65)),
+    segment(0xc0, Buffer.concat([Buffer.from([8]), size, Buffer.from([3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1])])),
+    segment(0xda, Buffer.from([3, 1, 0, 2, 0x11, 3, 0x11, 0, 63, 0])),
+    Buffer.alloc(64, 0x55), Buffer.from([0xff, 0xd9])]).toString('base64');
+}
+
 const bounds = { x: 0, y: 0, width: 256, height: 128 };
 const mapping = { qualificationReceipt: 'test-fixture:explicit-geometry-proof', displayId: 42,
   nativeWidth: 512, nativeHeight: 256, scaledWidth: 256, scaledHeight: 128, displayBounds: bounds };
@@ -81,7 +95,11 @@ function native({ health = {}, run, releaseError, releaseRun, adopt, capabilitie
   };
 }
 
-function helper({ alter, ignoreTerm = false, ignoreKill = false } = {}) {
+// latency(request) delays each reply as a real SSH-attached Host would; a
+// serial Host answers one request at a time in arrival order.
+// partGapsMs splits a requested capture reply into parts sent at those gaps.
+function helper({ alter, ignoreTerm = false, ignoreKill = false, latency, serial = false, pipelining,
+  partGapsMs, imageFormats } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.exitCode = null; child.signalCode = null; child.kills = [];
@@ -99,25 +117,60 @@ function helper({ alter, ignoreTerm = false, ignoreKill = false } = {}) {
     capture_enabled: true, screen_capture_permission: true, raw_vnc_exclusion: false,
     display_id: 42, displayGeneration: 7, renewal_interval_ms: 500,
     input_permit_ms: 1000, maximum_round_trip_ms: 500,
+    ...(pipelining === undefined ? {} : { request_pipelining: pipelining }),
+    ...(partGapsMs === undefined ? {} : { reply_parts: true }),
+    ...(imageFormats === undefined ? {} : { image_formats: imageFormats }),
     capture_ready: Boolean(owner), overlay_ready: Boolean(owner), ready: Boolean(owner),
     ui_heartbeat_age_ms: owner ? 0 : null, lease_remaining_ms: owner ? 3000 : 0,
     ...(owner || {}) });
+  let busyUntil = 0;
   child.stdin = new Writable({ write(bytes, encoding, callback) {
     const request = JSON.parse(bytes.toString());
     requests.push(request);
+    if (latency) {
+      request.sentAt = performance.now();
+      const start = serial ? Math.max(request.sentAt, busyUntil) : request.sentAt;
+      const done = start + latency(request);
+      if (serial) busyUntil = done;
+      setTimeout(() => { request.answeredAt = performance.now(); answer(request); }, done - request.sentAt);
+      callback();
+      return;
+    }
+    callback();
+    answer(request, true);
+  } });
+  function answer(request, deferred = false) {
     if (request.action === 'begin_activity' || request.action === 'renew_activity') {
       owner = { session_id: request.params.session_id, sequence: request.params.sequence,
         challenge: request.params.challenge };
     } else if (request.action === 'release_activity') owner = undefined;
     let result = state();
-    if (request.action === 'capture') result = { ...result, image: image(), mimeType: 'image/png',
+    if (request.action === 'capture') result = { ...result,
+      ...(request.params.format === 'jpeg' ? { image: jpegImage(), mimeType: 'image/jpeg' } :
+        { image: image(), mimeType: 'image/png' }),
       nativeWidth: 512, nativeHeight: 256, scaledWidth: 256, scaledHeight: 128,
       display_bounds: bounds, pixels_per_point_x: 2, pixels_per_point_y: 2, cursor_included: true };
     let response = { id: request.id, success: true, result };
     if (alter) response = alter(request, response);
-    callback();
-    if (response !== null) queueMicrotask(() => child.stdout.write(JSON.stringify(response) + '\n'));
-  } });
+    if (response === null) return;
+    if (partGapsMs && request.params.reply_part_bytes && response.result?.image) {
+      const { image, ...rest } = response.result;
+      const size = Math.ceil(image.length / partGapsMs.length);
+      let at = 0;
+      partGapsMs.forEach((gap, index) => {
+        at += gap;
+        setTimeout(() => child.stdout.write(JSON.stringify({ id: request.id,
+          part: { index, data: image.slice(index * size, (index + 1) * size) } }) + '\n'), at);
+      });
+      setTimeout(() => {
+        request.answeredAt = performance.now();
+        child.stdout.write(JSON.stringify({ ...response, result: { ...rest, image_parts: partGapsMs.length } }) + '\n');
+      }, at);
+      return;
+    }
+    if (deferred) queueMicrotask(() => child.stdout.write(JSON.stringify(response) + '\n'));
+    else child.stdout.write(JSON.stringify(response) + '\n');
+  }
   return { child, requests, launches, state, spawnImpl(command, args, options) {
     launches.push({ command, args, options }); return child;
   } };
@@ -379,6 +432,26 @@ test('broker keeps release-unconfirmed and sanitized capture cause with partial 
   }
 });
 
+test('a local helper deadline is named as the cause of an unconfirmed release', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-host-deadline-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const { executor } = await fixture({ helperOptions: { alter(request, response) {
+    return request.action === 'renew_activity' ? null : response;
+  } } });
+  const socketPath = path.join(directory, 'broker.sock');
+  const broker = await createBroker({ socketPath, config: { targets: { desktop: {} } },
+    factory: async () => executor });
+  t.after(() => assert.rejects(broker.close(), error => error.code === 'release_unconfirmed'));
+  const client = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => client.close());
+  await client.opened;
+  const result = await new McpSession(client).command({ action: 'screenshot' });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, 'Error: Target input release is unconfirmed; reconcile the target ' +
+    'before restarting its broker; cause=Host-helper receipt deadline exceeded');
+});
+
 test('configured helper screenshots use owned SCK PNG and retain ownership indication, never raw VNC', async () => {
   const { executor, vnc, host } = await fixture();
   try {
@@ -612,6 +685,37 @@ for (const field of ['challenge', 'session_id', 'sequence', 'displayGeneration',
     assert.equal(vnc.closes.length, 1);
   });
 }
+
+test('D38: Host-route screenshots are JPEG by default, PNG on request, and the codec is bound', async () => {
+  const { executor, host } = await fixture({ helperOptions: { imageFormats: ['png', 'jpeg'] } });
+  try {
+    const [jpeg] = await executor.execute([{ action: 'screenshot' }]);
+    assert.equal(jpeg.result.mimeType, 'image/jpeg');
+    const [png] = await executor.execute([{ action: 'screenshot', format: 'png' }]);
+    assert.equal(png.result.mimeType, 'image/png');
+    assert.deepEqual(host.requests.filter(request => request.action === 'capture').map(request => request.params.format),
+      ['jpeg', 'png']);
+    const result = await new McpSession(executor).command({ action: 'screenshot' });
+    assert.deepEqual(result.content.filter(item => item.type === 'image').map(item => item.mimeType), ['image/jpeg']);
+  } finally { await executor.close(); }
+  // A Host without image_formats is asked for nothing new and must send PNG.
+  const legacy = await fixture();
+  try {
+    const [frame] = await legacy.executor.execute([{ action: 'screenshot' }]);
+    assert.equal(frame.result.mimeType, 'image/png');
+    assert.equal(legacy.host.requests.find(request => request.action === 'capture').params.format, undefined);
+  } finally { await legacy.executor.close(); }
+  for (const alter of [
+    (request, response) => request.action === 'capture' ? { ...response, result: { ...response.result,
+      image: image(), mimeType: 'image/png' } } : response,
+    (request, response) => request.action === 'capture' ? { ...response, result: { ...response.result,
+      image: Buffer.from(jpegImage(), 'base64').subarray(0, 60).toString('base64') } } : response,
+  ]) {
+    const wrong = await fixture({ helperOptions: { imageFormats: ['png', 'jpeg'], alter } });
+    try { await assert.rejects(wrong.executor.execute([{ action: 'screenshot' }])); }
+    finally { await wrong.executor.close(); }
+  }
+});
 
 test('a partial or corrupt helper PNG is rejected without raw capture fallback', async () => {
   const { executor, vnc } = await fixture({ helperOptions: { alter(request, response) {
@@ -924,6 +1028,112 @@ test('lost helper transport invalidates all future input without reconnect or re
   assert.deepEqual(vnc.calls, []);
   assert.equal(vnc.closes.length, 1);
   assert.equal(host.launches.length, 1);
+});
+
+test('measured SSH latency: a slow connect and 1.6 s captures complete with input still lease-bound', async t => {
+  // Live PZM over SSH: first reply 0.5-0.9 s, warm replies ~5 ms, a 1080p
+  // capture 1-2 s (PNG encode and transfer, not ScreenCaptureKit).
+  let first = true;
+  const latency = request => {
+    if (first) { first = false; return 900; }
+    return request.action === 'capture' ? 1600 : 5;
+  };
+  for (const pipelining of [false, true]) {
+    await t.test(pipelining ? 'pipelining Host renews beside the capture' : 'serial Host lapses, then re-arms', async () => {
+      first = true;
+      const { executor, vnc, host } = await fixture({ config: { ...configuration(), mapping },
+        helperOptions: { latency, serial: !pipelining, pipelining } });
+      assert.ok(host.requests[0].answeredAt - host.requests[0].sentAt >= 850);
+      try {
+        const responses = await executor.execute([{ action: 'screenshot' }, { action: 'mouse_click', x: 4, y: 4 }]);
+        assert.equal(responses.length, 2);
+        assert.ok(responses[0].result.image);
+        assert.deepEqual(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+        const captures = host.requests.filter(request => request.action === 'capture');
+        assert.equal(captures.length, 2);
+        const renewals = host.requests.filter(request => request.action === 'renew_activity');
+        const during = renewals.filter(renewal => captures.some(capture =>
+          renewal.sentAt > capture.sentAt && renewal.sentAt < capture.answeredAt));
+        if (pipelining) assert.ok(during.length >= 4, `renewals during captures: ${during.length}`);
+        else assert.equal(during.length, 0);
+        // Input follows a renewal answered after the last capture finished.
+        const last = captures.at(-1).answeredAt;
+        assert.ok(renewals.some(renewal => renewal.sentAt >= last && renewal.answeredAt));
+        assert.equal(executor.permitLapsedAt, undefined);
+        assert.equal(executor.presentation.indicator, 'present');
+      } finally { await executor.close(); }
+    });
+  }
+});
+
+test('slow link: a split capture keeps arriving past 3 s while renewals pass between its parts', async t => {
+  // 147 ms ping and ~2 MB/s SSH: begin ~0.5 s at the Host, a 1.6 MB capture
+  // reply arriving over several seconds. Progress, not a flat deadline, bounds it.
+  const latency = request => request.action === 'begin_activity' ? 650 : request.action === 'capture' ? 900 : 150;
+  await t.test('progressing reply completes', async () => {
+    const { executor, host } = await fixture({ helperOptions: { latency, pipelining: true,
+      partGapsMs: [100, 900, 900, 900, 900, 900] } });
+    try {
+      const [response] = await executor.execute([{ action: 'screenshot' }]);
+      assert.ok(response.result.image);
+      const capture = host.requests.find(request => request.action === 'capture');
+      assert.equal(capture.params.reply_part_bytes, 65536);
+      assert.ok(capture.answeredAt - capture.sentAt > 4500);
+      assert.ok(host.requests.filter(request => request.action === 'renew_activity' &&
+        request.sentAt > capture.sentAt && request.sentAt < capture.answeredAt).length >= 6);
+    } finally { await executor.close(); }
+  });
+  await t.test('a stalled reply fails closed', async () => {
+    const { executor } = await fixture({ helperOptions: { latency, pipelining: true, partGapsMs: [100, 3400] } });
+    try {
+      await assert.rejects(executor.execute([{ action: 'screenshot' }]), /receipt deadline exceeded/);
+      await assert.rejects(executor.execute([{ action: 'screenshot' }]));
+    } finally { await executor.close(); }
+  });
+});
+
+test('a slow cold begin renews before the first heartbeat; a spent window arms only from that renewal', async t => {
+  // Live PZM: begin_activity takes ~0.5 s at the Host, ~0.65 s over a 147 ms
+  // link, leaving too little of its 1 s permit for the first heartbeat.
+  const slow = begin => request => request.action === 'begin_activity' ? begin : 150;
+  for (const [pipelining, begin] of [[false, 650], [true, 650], [true, 1200]]) {
+    await t.test(`${pipelining ? 'pipelining' : 'serial'} Host, ${begin} ms begin`, async () => {
+      const { executor, vnc, host } = await fixture({ config: { ...configuration(), mapping },
+        helperOptions: { latency: slow(begin), serial: !pipelining, pipelining } });
+      try {
+        await executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]);
+        await new Promise(resolve => setTimeout(resolve, 700));
+        assert.equal(executor.failed, undefined);
+        assert.deepEqual(host.requests.slice(1, 3).map(request => request.action),
+          ['begin_activity', 'renew_activity']);
+        assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+      } finally { await executor.close(); }
+    });
+  }
+  await t.test('a spent begin whose renewal never answers sends no input and retires', async () => {
+    const { executor, vnc } = await fixture({ config: { ...configuration(), mapping }, helperOptions: {
+      latency: slow(1200), pipelining: true,
+      alter: (request, response) => request.action === 'renew_activity' ? null : response } });
+    try {
+      await assert.rejects(executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]),
+        /receipt deadline|permit expired/);
+      assert.ok(executor.failed);
+      assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 0);
+    } finally { await executor.close(); }
+  });
+});
+
+test('a serial Host capture after mouse_down retires the owner rather than lapse with the button held', async () => {
+  const latency = request => request.action === 'capture' ? 1600 : 5;
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping },
+    helperOptions: { latency, serial: true, pipelining: false } });
+  try {
+    await assert.rejects(executor.execute([{ action: 'mouse_down', x: 2, y: 3 }, { action: 'screenshot' },
+      { action: 'mouse_up' }]), /permit expired/);
+    assert.deepEqual(vnc.calls.filter(action => action.action.startsWith('mouse_')).map(action => action.action),
+      ['mouse_down']);
+    assert.deepEqual(vnc.closes, [{ graceful: false }]);
+  } finally { await executor.close(); }
 });
 
 test('500ms renewal deadline cancels an in-flight native command on helper stall', async () => {

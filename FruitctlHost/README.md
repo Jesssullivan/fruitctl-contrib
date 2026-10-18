@@ -261,11 +261,38 @@ observer registration. No private screen-lock notifications or TCC bypasses are
 used; lock-screen behavior remains an attended qualification case.
 
 The helper-backed broker challenges every 500 ms during activity and rejects
-acknowledgements whose challenge round trip exceeds 500 ms. The native writer
+renewal and release acknowledgements whose round trip exceeds 500 ms. Three
+requests have other deadlines:
+
+- The first `health` also pays SSH connection setup: 5 s.
+- `begin_activity` takes an excluded-app snapshot and shows the indicator
+  before it answers: 2 s. Its permit still starts at the send, so a begin
+  that leaves less of it than the first heartbeat needs is followed at once
+  by a renewal. A begin answered after its whole 1 s window admits the owner
+  with input refused until that renewal arms it.
+- `capture` and `ax_snapshot` carry an encoded image or tree. The reply must
+  start within 3 s and keep arriving with no gap over 3 s, up to 20 s. Only
+  that reply's own bytes count, so a stalled reply cannot be kept alive by
+  renewals.
+
+A Host whose health reports `reply_parts: true` is asked for
+`reply_part_bytes` (64 KiB). It sends the image as consecutive
+`{"id","part":{"index","data"}}` lines, then the reply with `image_parts`, so a
+renewal reply can pass between parts on a slow link. The broker rejoins the
+parts and validates the image exactly as before. Parts change framing, not the
+image encoding.
+
+The native writer
 starts its own monotonic challenge deadline before helper renewal, validates
 session and VNC/display bindings, and admits no new input event more than
 1,000 ms after that native challenge. No remote timestamp extends this deadline;
-expiry is terminal for the owned episode. Held-state neutralization may follow
+expiry is terminal for the owned episode, with one exception. A Host that answers
+one request at a time cannot renew while it encodes a capture. A permit that
+expires during that observation lapses instead: input stays refused, and only a
+renewal sent after the lapse can re-arm it, within 1 s or the episode ends. A
+batch that has sent `mouse_down` never lapses; expiry retires it, releasing the hold. A
+Host whose health reports `request_pipelining: true` keeps renewing beside a
+capture, and for it any expiry stays terminal. Held-state neutralization may follow
 expiry, and an already blocked native send remains outside the responsive-writer
 proof. Uncertain input is never replayed. The 250 ms input-chunk and 2-second
 action values are design targets; current source allows longer actions under the

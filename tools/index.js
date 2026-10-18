@@ -92,6 +92,9 @@ export function validateActionParameters(input) {
   if (input.action === 'mouse_up' && (input.x === undefined) !== (input.y === undefined)) {
     throw new Error('mouse_up takes both x and y or neither');
   }
+  if (input.format !== undefined && input.action !== 'screenshot') {
+    throw new Error(`format applies only to screenshot, not ${input.action}`);
+  }
   if (input.modifiers !== undefined && input.action !== 'mouse_click') {
     throw new Error(`modifiers apply only to mouse_click, not ${input.action}`);
   }
@@ -130,7 +133,7 @@ export function vncCommandTool() {
       'Display dimensions may change after configure, reconnect or resize.',
       '',
       'ACTIONS:',
-      '  screenshot                              → full screen PNG',
+      '  screenshot     {format?}                → full screen (Host route: JPEG, or png)',
       '  cursor_crop                             → crop around cursor with crosshair',
       '  diff_check     {regions?, ignore?}      → changed ratio + boxes since baseline (replaces it)',
       '  set_baseline                            → save current screen for diff comparison',
@@ -208,6 +211,8 @@ export function vncCommandTool() {
       focused_app: z.boolean().optional().describe('ax_snapshot: frontmost application only (default true)'),
       menu_extras: z.boolean().optional()
         .describe('ax_snapshot: also read menu-bar extras, Control Center and their open menus (default false)'),
+      format: z.enum(['jpeg', 'png']).optional()
+        .describe('screenshot on the Host route: jpeg (default) or png for lossless evidence'),
       // Configure params (runtime timing/display adjustment)
       reset: z.boolean().optional().describe('Reset all params to defaults'),
       max_dimension: z.number().int().min(320).max(3840).optional()
