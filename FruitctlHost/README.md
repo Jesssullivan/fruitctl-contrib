@@ -170,6 +170,12 @@ discards the generation. `ax_action` fails with typed messages:
 - `ax_action_unsupported`: no AX action applies and a VNC click is not safe. A
   click is not safe when `vnc_fallback` is false, the element is a container, or
   it has no visible frame.
+- `human_consent_required`: the snapshot application or the element's live
+  owner is a consent, authorization or system dialog process
+  (UserNotificationCenter, universalAccessAuthWarn, SecurityAgent,
+  CoreServicesUIAgent, SoftwareUpdateNotificationManager). A human answers
+  those; this holds even when the broker's desktop-state sentinel is off or
+  read nothing.
 
 When the element definitely cannot act (no applicable action, or
 `kAXErrorActionUnsupported` / `kAXErrorAttributeUnsupported`) and a click is

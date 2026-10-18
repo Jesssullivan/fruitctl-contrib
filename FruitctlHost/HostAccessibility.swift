@@ -82,6 +82,8 @@ protocol HostAccessibilityProvider {
     /// True for an out-of-process element's owner that is a system view
     /// service rather than a regular app: its remote views may refuse actions.
     func isSystemRemoteViewService(processID: pid_t) -> Bool
+    /// The process's executable name, or nil when it cannot be read.
+    func executableName(processID: pid_t) -> String?
 }
 
 /// Builds the bounded, framebuffer-mapped snapshot. Pure over the provider's
@@ -373,5 +375,15 @@ final class HostSystemAccessibilityProvider: HostAccessibilityProvider {
         guard application.activationPolicy != .regular else { return false }
         let bundle = application.bundleIdentifier ?? ""
         return bundle.isEmpty || bundle.hasPrefix("com.apple.")
+    }
+
+    func executableName(processID: pid_t) -> String? {
+        if let name = NSRunningApplication(processIdentifier: processID)?.executableURL?.lastPathComponent {
+            return name
+        }
+        // A view service is not a registered app; read its path directly.
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return buffer.withUnsafeBufferPointer { URL(fileURLWithPath: String(cString: $0.baseAddress!)).lastPathComponent }
     }
 }

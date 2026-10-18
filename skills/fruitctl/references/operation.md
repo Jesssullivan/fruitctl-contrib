@@ -147,7 +147,9 @@ snapshot is refused before anything runs.
   window.
 - Element actions are input. The desktop-state sentinel refuses them under a
   consent or system dialog, the lock screen or display sleep, as it refuses
-  any other input. Never use them to answer a consent dialog.
+  any other input. Never use them to answer a consent dialog. The Host also
+  refuses any element owned by a consent, authorization or system dialog
+  process with `human_consent_required`, even when the sentinel is off.
 - An action runs only after its element is read and the lease and the human
   Stop latch are checked again. The Host makes exactly one Accessibility call
   and never retries it.

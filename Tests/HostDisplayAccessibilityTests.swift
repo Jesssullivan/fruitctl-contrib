@@ -29,6 +29,7 @@ private struct FakeAccessibilityProvider: HostAccessibilityProvider {
         (focusedOnly ? focused : all).filter { $0.processID != processID }
     }
     func isSystemRemoteViewService(processID: pid_t) -> Bool { false }
+    func executableName(processID: pid_t) -> String? { nil }
 }
 
 final class HostDisplayAccessibilityTests: XCTestCase {

@@ -97,6 +97,8 @@ latest snapshot, or its element is gone; take a new `ax_snapshot`.
 prompts) did not respond to Accessibility and no click was guessed.
 `ax_action_unsupported` means no action applies and no click was safe. For
 both, report the failure, or ask the operator before clicking by coordinates.
+`human_consent_required` means the element belongs to a consent or system
+dialog; a human must answer it, so report it and do not click it by coordinates.
 Use `menu_extras: true` on `ax_snapshot` to reach menu-bar extras and Control
 Center.
 

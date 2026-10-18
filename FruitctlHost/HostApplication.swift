@@ -745,6 +745,12 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             case .unresponsive: throw HostAXActionError.unreachable
             case .live(let live): state = live
             }
+            // A human answers consent dialogs (D16). Refused before any
+            // AX call or click, whatever the desktop-state sentinel read.
+            try HostAXActionPlanner.refuseConsentDialog(ownerExecutables:
+                ([target.processID] + (state.ownerProcessID.map { [$0] } ?? [])).map {
+                    accessibility.executableName(processID: $0)
+                })
             let remote = state.ownerProcessID.map {
                 $0 != target.processID && accessibility.isSystemRemoteViewService(processID: $0)
             } ?? false

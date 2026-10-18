@@ -13,6 +13,9 @@ enum HostAXActionError: String, Error {
     case unreachable = "ax_unreachable"
     /// No Accessibility action applies and no safe VNC fallback point exists.
     case unsupported = "ax_action_unsupported"
+    /// A consent, authorization or system dialog owns the element; a human
+    /// answers it. The broker's desktop-state code for the same condition.
+    case consentDialog = "human_consent_required"
 }
 
 enum HostAXActionKind: String { case press, focus }
@@ -189,6 +192,21 @@ enum HostAXActionPlanner {
     static let containerRoles: Set<String> = ["AXApplication", "AXWindow", "AXSheet", "AXPopover", "AXDrawer",
         "AXGroup", "AXScrollArea", "AXSplitGroup", "AXLayoutArea", "AXList", "AXOutline", "AXTable",
         "AXBrowser", "AXToolbar", "AXTabGroup", "AXMenuBar", "AXMenu", "AXGrid", "AXWebArea", "AXUnknown"]
+
+    /// Executables that draw consent, authorization and system dialogs, the
+    /// same set the broker's desktop-state sentinel watches. No element they
+    /// own is pressed, focused or clicked, even when the sentinel is off or
+    /// could not read the desktop.
+    static let consentDialogOwners: Set<String> = ["UserNotificationCenter", "universalAccessAuthWarn",
+        "SecurityAgent", "CoreServicesUIAgent", "SoftwareUpdateNotificationManager"]
+
+    /// Refuses before any Accessibility call when the snapshot application
+    /// or the element's live owner is a dialog owner.
+    static func refuseConsentDialog(ownerExecutables: [String?]) throws {
+        if ownerExecutables.contains(where: { $0.map(consentDialogOwners.contains) ?? false }) {
+            throw HostAXActionError.consentDialog
+        }
+    }
 
     static func operation(for kind: HostAXActionKind, state: HostAXLiveState,
                           surface: HostAXSurface) -> HostAXOperation? {

@@ -184,6 +184,19 @@ final class HostAccessibilityActionTests: XCTestCase {
             allowed: true), .vncClick(x: 3_012, y: 10))
     }
 
+    func testElementsOwnedByConsentDialogsAreRefused() {
+        // The snapshot application or the element's live owner may be the dialog process.
+        for owners: [String?] in [["UserNotificationCenter"], ["Safari", "SecurityAgent"],
+                                  [nil, "universalAccessAuthWarn"], ["CoreServicesUIAgent", nil]] {
+            XCTAssertThrowsError(try HostAXActionPlanner.refuseConsentDialog(ownerExecutables: owners),
+                                 "\(owners)") { XCTAssertEqual($0 as? HostAXActionError, .consentDialog) }
+        }
+        XCTAssertNoThrow(try HostAXActionPlanner.refuseConsentDialog(ownerExecutables: ["Safari", nil]))
+        XCTAssertNoThrow(try HostAXActionPlanner.refuseConsentDialog(ownerExecutables: ["ControlCenter"]))
+        // The broker keeps this wire reason as the sentinel's typed code.
+        XCTAssertEqual(HostAXActionError.consentDialog.rawValue, "human_consent_required")
+    }
+
     func testAXErrorsSeparateDefiniteRefusalFromPossibleAction() {
         XCTAssertEqual(HostAXPerformResult(.success), .performed)
         for status: AXError in [.actionUnsupported, .attributeUnsupported, .notImplemented, .illegalArgument, .noValue] {
