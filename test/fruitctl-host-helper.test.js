@@ -1757,3 +1757,106 @@ test('AX action receipts that do not answer the request fail closed', async t =>
     });
   }
 });
+
+// TIN-5509: a maximum-budget renewal needs dispatch headroom within the same permit.
+test('deadline renewal survives a bounded dispatch stall without extending its permit', async () => {
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping }, helperOptions: {
+    pipelining: true, imageFormats: ['jpeg', 'png'],
+    latency: request => request.action === 'renew_activity' ? 450 : 0 } });
+  let stall;
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    const acceptedSend = executor.permitUntil - 1000;
+    // No Host reply is due during this 120 ms event-loop dispatch stall.
+    stall = setTimeout(() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120),
+      Math.max(0, acceptedSend + 480 - performance.now()));
+    await new Promise(resolve => setTimeout(resolve, 850));
+    assert.equal(executor.failed, undefined);
+    await executor.execute([{ action: 'mouse_click', x: 4, y: 4 }, { action: 'wait', ms: 50 }]);
+    assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+    assert.equal(vnc.calls.some(action => action.action === 'mouse_down'), false);
+  } finally { clearTimeout(stall); await executor.close(); }
+});
+
+test('a queued renewal callback cannot restart activity after acknowledged release', async () => {
+  const { executor, vnc, host } = await fixture();
+  let queued;
+  const originalTimeout = globalThis.setTimeout;
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    // Capture a callback already dispatched by the timer, while release runs.
+    globalThis.setTimeout = callback => {
+      queued = callback;
+      return originalTimeout(() => {}, 60000);
+    };
+    try { executor.scheduleRenewal(); }
+    finally { globalThis.setTimeout = originalTimeout; }
+    assert.equal(typeof queued, 'function');
+    await executor.release();
+    const requests = host.requests.length, controls = vnc.permitControls.length;
+    queued();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(executor.failed, undefined);
+    assert.equal(executor.activityActive, false);
+    assert.equal(host.requests.length, requests);
+    assert.equal(vnc.permitControls.length, controls);
+  } finally { globalThis.setTimeout = originalTimeout; await executor.close(); }
+});
+
+test('a long progressing observation retains its original challenge only until completion', async () => {
+  const { executor, host } = await fixture({ helperOptions: {
+    latency: request => request.action === 'begin_activity' ? 650 : request.action === 'capture' ? 900 : 150,
+    pipelining: true, partGapsMs: [100, 1900, 1900, 1900, 1900, 1900, 1900] } });
+  try {
+    const [response] = await executor.execute([{ action: 'screenshot' }]);
+    assert.ok(response.result.image);
+    const capture = host.requests.find(request => request.action === 'capture');
+    assert.ok(capture.answeredAt - capture.sentAt > 11000);
+    assert.ok(host.requests.filter(request => request.action === 'renew_activity' &&
+      request.sentAt > capture.sentAt && request.sentAt < capture.answeredAt).length > 16);
+    assert.ok(executor.issued.size <= 16);
+    assert.equal(executor.observationSequenceFloor, undefined);
+  } finally { await executor.close(); }
+});
+
+test('a late native permit acknowledgement never revives an expired grant', async () => {
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping } });
+  const control = vnc.inputPermitControl.bind(vnc);
+  vnc.inputPermitControl = async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 550));
+    return control(...args);
+  };
+  try {
+    await assert.rejects(executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]),
+      /grant deadline|permit expired/);
+    assert.ok(executor.failed);
+    await new Promise(resolve => setTimeout(resolve, 600));
+    await assert.rejects(executor.execute([{ action: 'mouse_click', x: 4, y: 4 }]));
+    assert.equal(vnc.calls.some(action => action.action === 'mouse_click'), false);
+  } finally { await executor.close(); }
+});
+
+
+test('a renewal burst cannot grow an in-flight observation challenge range without a bound', async () => {
+  let active, peak = 0, captureStarted;
+  const started = new Promise(resolve => { captureStarted = resolve; });
+  const { executor, vnc } = await fixture({ helperOptions: {
+    pipelining: true, partGapsMs: [100, 1800],
+    alter(request, response) {
+      if (active) peak = Math.max(peak, active.issued.size);
+      if (request.action === 'capture') captureStarted();
+      return response;
+    } } });
+  active = executor;
+  try {
+    const rejected = assert.rejects(executor.execute([{ action: 'screenshot' }]));
+    await started;
+    for (let i = 0; i < 130 && !executor.failed; i++) {
+      await executor.activity('renew_activity').catch(error => executor.fail(error));
+    }
+    await rejected;
+    assert.match(executor.failed?.message || '', /challenge budget exceeded/);
+    assert.ok(peak <= 128);
+    assert.equal(vnc.calls.some(action => action.action === 'mouse_click'), false);
+  } finally { await executor.close(); }
+});
