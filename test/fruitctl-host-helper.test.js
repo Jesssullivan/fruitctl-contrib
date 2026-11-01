@@ -8,7 +8,7 @@ import { deflateSync } from 'node:zlib';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createHostHelperExecutor, HostHelperExecutor, hostHelperRefusalMessage } from '../lib/broker/host-helper.mjs';
+import { createHostHelperExecutor, HostHelperExecutor, hostHelperRefusalMessage, hostHelperFailureCause } from '../lib/broker/host-helper.mjs';
 import { createBroker, TargetLane } from '../lib/broker/server.mjs';
 import { BrokerExecutor } from '../lib/broker/client.mjs';
 import { McpSession } from '../lib/mcp/server.js';
@@ -216,7 +216,8 @@ test('unconfirmed retirement never appends an untrusted executor message', async
   try {
     await assert.rejects(lane.execute([{ action: 'wait' }]), error => {
       assert.equal(error.code, 'release_unconfirmed');
-      assert.equal(error.message, 'Target input release is unconfirmed; reconcile the target before restarting its broker');
+      assert.equal(error.message, 'Target input release is unconfirmed; reconcile the target before restarting its broker' +
+        '; firstCause=operation/unknown');
       assert.equal(error.message.includes(marker), false);
       assert.equal(error, lane.cleanupFailure);
       return true;
@@ -409,7 +410,8 @@ test('broker keeps release-unconfirmed and sanitized capture cause with partial 
         await session.queue({ actions: [{ action: 'wait' }, { action: 'screenshot' }, { action: 'key_tap', key: 'tab' }] });
       // An acquired helper that fails cannot certify a clean activity release.
       // Its bounded cause accompanies this error; the sticky lane stays revoked.
-      const safetyMessage = 'Target input release is unconfirmed; reconcile the target before restarting its broker';
+      const safetyMessage = 'Target input release is unconfirmed; reconcile the target before restarting its broker' +
+        '; firstCause=host_helper/helper_refused';
       const id = host.requests.find(request => request.action === 'capture').id;
       const message = `${safetyMessage}; cause=Host helper refused request: capture_failed; ` +
         `phase=capture_image; apple_domain=SCStreamErrorDomain; apple_code=-1; request=${id}`;
@@ -449,7 +451,7 @@ test('a local helper deadline is named as the cause of an unconfirmed release', 
   const result = await new McpSession(client).command({ action: 'screenshot' });
   assert.equal(result.isError, true);
   assert.equal(result.content[0].text, 'Error: Target input release is unconfirmed; reconcile the target ' +
-    'before restarting its broker; cause=Host-helper receipt deadline exceeded');
+    'before restarting its broker; firstCause=host_helper/deadline; cause=Host-helper receipt deadline exceeded');
 });
 
 test('configured helper screenshots use owned SCK PNG and retain ownership indication, never raw VNC', async () => {
@@ -1859,4 +1861,216 @@ test('a renewal burst cannot grow an in-flight observation challenge range witho
     assert.ok(peak <= 128);
     assert.equal(vnc.calls.some(action => action.action === 'mouse_click'), false);
   } finally { await executor.close(); }
+});
+
+test('first native causes survive cleanup, stay immutable and never dispatch queued input', async t => {
+  for (const phase of ['mapping_health', 'observation_adopt', 'native_permit_begin', 'native_permit_grant']) {
+    await t.test(phase, async () => {
+      const marker = 'SYNTHETIC_SECRET_NOT_FOR_DIAGNOSTICS';
+      const { executor, vnc } = await fixture({ config: { ...configuration(), mapping } });
+      const execute = vnc.execute.bind(vnc), control = vnc.inputPermitControl.bind(vnc);
+      vnc.execute = async (actions, options) => {
+        const result = await execute(actions, options);
+        if ((phase === 'mapping_health' && actions[0].action === 'health') ||
+            (phase === 'observation_adopt' && actions[0].action === 'adopt_observation')) {
+          return [{ id: 'synthetic-negative-ack', error: { code: -32000, message: marker,
+            data: { token: marker, reason: marker } } }];
+        }
+        return result;
+      };
+      vnc.inputPermitControl = async (method, ...args) => {
+        if (method === (phase === 'native_permit_begin' ? 'begin_input_permit' :
+          phase === 'native_permit_grant' ? 'grant_input_permit' : 'not-a-control')) {
+          return { id: 'synthetic-negative-ack', error: { code: -32000, message: marker, data: marker } };
+        }
+        return control(method, ...args);
+      };
+      const lane = new TargetLane({}, async () => executor);
+      const progress = [];
+      const first = lane.execute([{ action: 'wait' }, { action: 'mouse_click', x: 4, y: 5 },
+        { action: 'key_tap', key: 'tab' }], { onResponse: response => progress.push(response) });
+      const queued = lane.execute([{ action: 'key_tap', key: 'enter' }]).catch(error => error);
+      try {
+        await assert.rejects(first, error => {
+          assert.equal(error.code, 'release_unconfirmed');
+          assert.match(error.message, new RegExp(`firstCause=${phase}/native_refused; native_code=-32000`));
+          assert.equal(error.message.includes(marker), false);
+          return true;
+        });
+        assert.deepEqual(lane.firstCause, { phase, reason: 'native_refused', native_code: -32000 });
+        assert.equal(Object.isFrozen(lane.firstCause), true);
+        assert.throws(() => { lane.firstCause.reason = marker; }, TypeError);
+        assert.throws(() => { lane.firstCause = { phase: marker }; }, TypeError);
+        const cause = lane.firstCause;
+        executor.failed.message = marker;
+        executor.failed.code = marker;
+        executor.failed.cause = { phase: marker, reason: marker };
+        lane.rememberFirstCause(new Error(marker));
+        assert.equal(lane.firstCause, cause);
+        assert.equal((await queued) instanceof Error, true);
+        await assert.rejects(lane.execute([{ action: 'key_tap', key: 'space' }]), error =>
+          error === lane.cleanupFailure && !error.message.includes(marker));
+        assert.equal(progress.length, 1, 'the acknowledged wait remains visible');
+        assert.equal(vnc.calls.some(action => ['mouse_click', 'key_tap'].includes(action.action)), false);
+      } finally { await assert.rejects(lane.close(), error => error.code === 'release_unconfirmed'); }
+    });
+  }
+});
+
+test('first cause reaches MCP and journal without a native payload or replay', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-first-cause-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const marker = 'SYNTHETIC_PRIVATE_NATIVE_PAYLOAD';
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping }, nativeOptions: {
+    adopt: async () => [{ id: 'native-adoption', error: { code: marker, message: marker,
+      data: { private: marker } } }],
+  } });
+  const entries = [];
+  const journal = { append(batch) { entries.push(...batch); return Promise.resolve(); },
+    flush: async () => {}, status: () => ({}) };
+  const socketPath = path.join(directory, 'broker.sock');
+  const broker = await createBroker({ socketPath, config: { targets: { desktop: {} } },
+    factory: async () => executor, journal });
+  t.after(() => assert.rejects(broker.close(), error => error.code === 'release_unconfirmed'));
+  const client = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => client.close());
+  await client.opened;
+  const session = new McpSession(client);
+  const result = await session.queue({ actions: [{ action: 'wait' },
+    { action: 'mouse_click', x: 2, y: 3 }, { action: 'key_tap', key: 'tab' }] });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.completed, 1);
+  assert.equal(result.structuredContent.failedIndex, 2);
+  assert.match(result.structuredContent.error.message,
+    /firstCause=observation_adopt\/native_refused/);
+  assert.equal(result.structuredContent.error.message.includes('native_code='), false);
+  const sticky = await session.command({ action: 'screenshot' });
+  assert.equal(sticky.structuredContent.error.message, result.structuredContent.error.message);
+  assert.equal(JSON.stringify({ result, sticky, entries }).includes(marker), false);
+  assert.ok(entries.some(entry => entry.result.error?.message.includes('firstCause=observation_adopt/native_refused')));
+  assert.equal(vnc.calls.some(action => ['mouse_click', 'key_tap'].includes(action.action)), false);
+});
+
+test('native context refusal is distinct from permit expiry and malformed mapping', async t => {
+  for (const [message, reason, code, data] of [
+    ['Failed to send VNC event: Observed display changed; take a new screenshot before input', 'context_changed', -32000],
+    ['Failed to send VNC event: Native input permit expired', 'permit_expired', -32000],
+    ['Failed to send VNC event: Native input permit grant binding or challenge deadline failed', 'grant_rejected', -32000],
+    ['not reflected', 'input_not_ready', -32013, { reason: 'input_not_ready', remaining_ms: 3 }],
+  ]) {
+    await t.test(reason, async () => {
+      const { executor } = await fixture({ config: { ...configuration(), mapping }, nativeOptions: {
+        run: async () => [{ id: 'native-input', error: { code, message, data } }],
+      } });
+      try {
+        await assert.rejects(executor.execute([{ action: 'mouse_click', x: 1, y: 1 }]), error => {
+          assert.deepEqual(hostHelperFailureCause(error), { phase: 'native_input', reason, native_code: code });
+          return true;
+        });
+      } finally { await executor.close(); }
+    });
+  }
+  const { executor } = await fixture({ config: { ...configuration(), mapping }, nativeOptions: { health: { nativeWidth: 1 } } });
+  try {
+    await assert.rejects(executor.execute([{ action: 'mouse_click', x: 1, y: 1 }]), error => {
+      assert.deepEqual(hostHelperFailureCause(error), { phase: 'mapping_health', reason: 'geometry_mismatch' });
+      return true;
+    });
+  } finally { await executor.close(); }
+});
+
+test('cause branding ignores forged fields and accepts frozen errors without reflecting values', async () => {
+  const { executor } = await fixture();
+  try {
+    const marker = 'SYNTHETIC_SECRET_CAUSE';
+    const forged = Object.assign(new Error(marker), { cause: { phase: 'native_input', reason: marker },
+      firstCause: { phase: marker }, code: marker, data: { reason: marker } });
+    assert.equal(hostHelperFailureCause(forged), undefined);
+    const frozen = Object.freeze(new Error('Native input-permit control deadline exceeded'));
+    await assert.rejects(executor.nativeOperation('native_permit_begin', async () => { throw frozen; }), error => {
+      assert.equal(error, frozen);
+      assert.deepEqual(hostHelperFailureCause(error), { phase: 'native_permit_begin', reason: 'deadline' });
+      return true;
+    });
+    await assert.rejects(executor.nativeOperation('observation_adopt', async () => { throw frozen; }), error => {
+      assert.deepEqual(hostHelperFailureCause(error), { phase: 'native_permit_begin', reason: 'deadline' });
+      return true;
+    });
+    await assert.rejects(executor.nativeOperation(marker, async () => { throw forged; }), error => {
+      assert.deepEqual(hostHelperFailureCause(error), { phase: 'operation', reason: 'unknown' });
+      assert.equal(JSON.stringify(hostHelperFailureCause(error)).includes(marker), false);
+      return true;
+    });
+    assert.equal(hostHelperFailureCause(Object.assign(new Error(frozen.message), frozen)), undefined);
+  } finally { await executor.close(); }
+});
+
+test('a native input negative ACK keeps its typed progress and sticky first cause after cleanup', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-input-cause-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const nativeMessage = 'Failed to send VNC event: Observed display changed; take a new screenshot before input';
+  const { executor, vnc } = await fixture({ config: { ...configuration(), mapping }, nativeOptions: {
+    run: async actions => actions.map(action => action.action === 'wait'
+      ? { id: 'native-wait', result: { detail: 'input acknowledged' } }
+      : { id: 'native-input-refusal', error: { code: -32000, message: nativeMessage } }),
+  } });
+  const socketPath = path.join(directory, 'broker.sock');
+  const broker = await createBroker({ socketPath, config: { targets: { desktop: {} } }, factory: async () => executor });
+  t.after(() => assert.rejects(broker.close(), error => error.code === 'release_unconfirmed'));
+  const client = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => client.close());
+  await client.opened;
+  const session = new McpSession(client);
+  const result = await session.queue({ actions: [{ action: 'wait' },
+    { action: 'mouse_click', x: 2, y: 3 }, { action: 'key_tap', key: 'tab' }] });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.completed, 1);
+  assert.equal(result.structuredContent.failedIndex, 2);
+  // Existing native input replies keep their typed progress. The separate
+  // quarantine still names the first classified cause on subsequent calls.
+  assert.deepEqual(result.structuredContent.error, { code: -32000, message: nativeMessage });
+  const sticky = await session.command({ action: 'screenshot' });
+  assert.match(sticky.structuredContent.error.message,
+    /release is unconfirmed.*firstCause=native_input\/context_changed; native_code=-32000/);
+  assert.deepEqual(hostHelperFailureCause(executor.failed), {
+    phase: 'native_input', reason: 'context_changed', native_code: -32000 });
+  assert.equal(vnc.calls.filter(action => action.action === 'mouse_click').length, 1);
+  assert.equal(vnc.calls.some(action => action.action === 'key_tap'), false);
+});
+
+
+test('an unbranded initiating failure stays unknown when cleanup has a different branded cause', async () => {
+  const { executor: tagger } = await fixture();
+  const marker = 'SYNTHETIC_UNTRUSTED_INITIATOR';
+  let cleanupError;
+  await assert.rejects(tagger.nativeOperation('native_permit_grant', async () => {
+    throw new Error('Native input-permit control deadline exceeded');
+  }), error => { cleanupError = error; return true; });
+  let executor;
+  executor = native({ run: async () => { throw new Error(marker); }, releaseRun: async () => {
+    executor.failed = cleanupError;
+    throw cleanupError;
+  } });
+  const lane = new TargetLane({}, async () => executor);
+  try {
+    await assert.rejects(lane.execute([{ action: 'wait' }]), error => {
+      assert.equal(error.code, 'release_unconfirmed');
+      assert.match(error.message, /firstCause=operation\/unknown$/);
+      assert.equal(error.message.includes(marker), false);
+      return true;
+    });
+    assert.deepEqual(lane.firstCause, { phase: 'operation', reason: 'unknown' });
+    assert.equal(Object.isFrozen(lane.firstCause), true);
+    assert.deepEqual(hostHelperFailureCause(cleanupError), { phase: 'native_permit_grant', reason: 'deadline' });
+    lane.rememberFirstCause(cleanupError);
+    assert.deepEqual(lane.firstCause, { phase: 'operation', reason: 'unknown' });
+    await assert.rejects(lane.execute([{ action: 'key_tap', key: 'tab' }]), error =>
+      error === lane.cleanupFailure && error.message.endsWith('firstCause=operation/unknown'));
+    assert.deepEqual(executor.calls.map(action => action.action), ['wait']);
+  } finally {
+    await assert.rejects(lane.close(), error => error.code === 'release_unconfirmed');
+    await tagger.close();
+  }
 });
