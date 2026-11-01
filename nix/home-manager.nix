@@ -150,6 +150,11 @@ let
         host = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; description = "Seat-side VNC address, usually an SSH tunnel loopback endpoint."; };
         port = lib.mkOption { type = lib.types.port; default = 15900; description = "Seat-side VNC port; distinct from a local Screen Sharing listener."; };
         username = lib.mkOption { type = lib.types.str; default = ""; description = "Target account name. No password is stored in configuration."; };
+        requestMode = lib.mkOption {
+          type = lib.types.nullOr (lib.types.enum [ "stream" "on-demand" ]);
+          default = null;
+          description = "Optional native RFB request mode. Unset keeps the controller default. On-demand remains unqualified on Apple Screen Sharing.";
+        };
         captureTimeoutMs = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 1000 20000);
           default = null;
@@ -382,7 +387,7 @@ in {
         { assertion = cfg.bridgeSocketPath == null || absolute cfg.bridgeSocketPath; message = "Fruitctl bridgeSocketPath must be an absolute remote path when supplied."; }
         { assertion = cfg.bridgeCommand == "fruitctl" || absolute cfg.bridgeCommand; message = "Fruitctl bridgeCommand must be fruitctl or an absolute executable path."; }
         { assertion = isDarwin || (cfg.bridgeHost != null && cfg.bridgeHost != "" && !(lib.hasPrefix "-" cfg.bridgeHost) && !(lib.hasInfix "\n" cfg.bridgeHost)); message = "Linux Fruitctl requires an existing Darwin bridgeHost SSH alias."; }
-        { assertion = isDarwin || (cfg.nativePackage == null && builtins.all (name: cfg.targets.${name}.targetId == null && cfg.targets.${name}.inputSource == null && !cfg.targets.${name}.input.pasteUnmappable && clipboardPolicy cfg.targets.${name} == { } && cfg.targets.${name}.credentialFile == null && cfg.targets.${name}.credential == null && cfg.targets.${name}.secrets == { } && cfg.targets.${name}.daemonPath == null && cfg.targets.${name}.hostHelper == null && cfg.targets.${name}.vnc.username == "" && cfg.targets.${name}.vnc.host == "127.0.0.1" && cfg.targets.${name}.vnc.port == 15900 && cfg.targets.${name}.vnc.captureTimeoutMs == null && wakePolicy cfg.targets.${name} == { } && desktopStatePolicy cfg.targets.${name} == { }) targetNames); message = "Linux declares Fruitctl target names only; configure physical identities, VNC, credentials and native clients on the Darwin bridge."; }
+        { assertion = isDarwin || (cfg.nativePackage == null && builtins.all (name: cfg.targets.${name}.targetId == null && cfg.targets.${name}.inputSource == null && !cfg.targets.${name}.input.pasteUnmappable && clipboardPolicy cfg.targets.${name} == { } && cfg.targets.${name}.credentialFile == null && cfg.targets.${name}.credential == null && cfg.targets.${name}.secrets == { } && cfg.targets.${name}.daemonPath == null && cfg.targets.${name}.hostHelper == null && cfg.targets.${name}.vnc.username == "" && cfg.targets.${name}.vnc.host == "127.0.0.1" && cfg.targets.${name}.vnc.port == 15900 && cfg.targets.${name}.vnc.captureTimeoutMs == null && cfg.targets.${name}.vnc.requestMode == null && wakePolicy cfg.targets.${name} == { } && desktopStatePolicy cfg.targets.${name} == { }) targetNames); message = "Linux declares Fruitctl target names only; configure physical identities, VNC, credentials and native clients on the Darwin bridge."; }
         { assertion = !isDarwin || builtins.all (name: let target = cfg.targets.${name}; in
             (if target.credential != null then target.credentialFile == null && sourceValid target.credential else absolute target.credentialFile)
             && absolute (if target.daemonPath != null then target.daemonPath else nativePath)) targetNames;
