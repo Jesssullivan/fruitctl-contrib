@@ -48,6 +48,8 @@ let
     desktopState = desktopStatePolicy target;
   } // lib.optionalAttrs (target.daemonPath != null || nativePath != null) {
     daemonPath = if target.daemonPath != null then target.daemonPath else nativePath;
+  } // lib.optionalAttrs (target.hostHelperFile != null) {
+    inherit (target) hostHelperFile;
   } // lib.optionalAttrs (target.hostHelper != null) {
     # Unset display identities and mapping fields stay absent, never null.
     hostHelper = lib.filterAttrs (_: value: value != null) {
@@ -235,6 +237,11 @@ let
           description = "Sentinel SSH destination, ideally the console user. Unset falls back to wake.ssh, then hostHelper.sshHost; with none of them the sentinel reports not_configured and refuses nothing.";
         };
       };
+      hostHelperFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Absolute private runtime binding file. The broker validates its targetId and Host configuration. Display identities stay outside the Nix store.";
+      };
       hostHelper = lib.mkOption {
         default = null;
         type = lib.types.nullOr (lib.types.submodule {
@@ -353,6 +360,7 @@ in {
     }
     (lib.mkIf cfg.enable {
       assertions = [
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in target.hostHelperFile == null || (isDarwin && absolute target.hostHelperFile && target.hostHelper == null && target.targetId != null && target.targetId != "")) targetNames; message = "Fruitctl private Host binding requires a Darwin targetId, an absolute file path and no inline hostHelper."; }
         { assertion = !cfg.installOnly || !cfg.enableService; message = "Fruitctl installOnly cannot enable a broker or relay service."; }
         { assertion = !cfg.installOnly || targetNames == [ ]; message = "Fruitctl installOnly requires no targets; use controller mode for target profiles."; }
         { assertion = !cfg.installOnly || (cfg.bridgeHost == null && cfg.bridgeSocketPath == null && cfg.bridgeCommand == "fruitctl"); message = "Fruitctl installOnly cannot configure an SSH bridge."; }

@@ -408,3 +408,22 @@ owning infrastructure module while replacing its runtime/skill source with
 this pinned package. Validate package evaluation, target selection, secret
 absence from generated agent files, and service argv before an attended switch.
 No public configuration imports a fleet host inventory or private transcript.
+
+## Private Host binding
+
+Set `targets.<name>.hostHelperFile` to an absolute, private runtime JSON file
+when display identity must stay outside the Nix store. Do not also set
+`hostHelper`. The target must declare `targetId`.
+
+The file uses schema `fruitctl.host-binding.v1` with exactly `schema`,
+`targetId` and `hostHelper`. Its `targetId` must match the configured target.
+The `hostHelper` object uses the same SSH, executable, display and qualified
+mapping fields as the inline option. Keep the file and its containing
+directory private to the broker's user. A missing file, symlink, public file,
+invalid helper or mismatched identity refuses configuration loading. There is
+no raw VNC fallback.
+
+The operator materializes and qualifies the binding on the configured Darwin
+controller. Nix emits only its pathname. Loading a binding does not start the
+Host, enable capture or grant privacy permissions. A qualified Host session
+starts its indicator when it acquires activity and clears it on release.
