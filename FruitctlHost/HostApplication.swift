@@ -297,7 +297,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                             displayGeneration: generation, now: invokedAt)
         let eventID = lease.lastHumanStopEvent?.eventID
         // Release any button or key an input action holds, synchronously.
-        activeInputSession?.releaseHeld()
+        // The action's own stop reports it; this count is diagnostic only.
+        _ = activeInputSession?.releaseHeld()
         invalidateActivity(reason: .humanStopped)
         updateHumanControl()
         let completionHostTime = HostCoreMediaClock.sample()

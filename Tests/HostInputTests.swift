@@ -219,7 +219,7 @@ final class HostInputTests: XCTestCase {
 
     func testSystemShortcutsAndTheAppleMenuAreRefused() throws {
         for keys in [["cmd", "tab"], ["command", "space"], ["ctrl", "cmd", "q"], ["cmd", "option", "escape"],
-                     ["rcmd", "shift", "q"], ["ctrl", "f2"], ["ctrl", "right"]] {
+                     ["rcmd", "shift", "q"], ["ctrl", "f2"], ["ctrl", "right"], ["cmd", "shift", "tab"], ["cmd", "f5"]] {
             let combo = try request(["kind": .string("key"), "keys": .array(keys.map { .string($0) })])
             XCTAssertThrowsError(try HostInputGate.check(combo, environment(window: nil), start: true,
                                                          pointerCheck: false), "\(keys)") {
@@ -232,6 +232,9 @@ final class HostInputTests: XCTestCase {
         var menu = environment(window: HostInputProcess(processID: 300, bundleID: nil, executable: nil))
         menu.windowOwnerName = "Window Server"
         menu.windowLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+        // An unreadable Apple menu frame refuses the menu bar.
+        XCTAssertThrowsError(try HostInputGate.check(click, menu, start: true, pointerCheck: true,
+                                                     point: CGPoint(x: 160, y: 10)))
         menu.appleMenuFrame = CGRect(x: 100, y: 0, width: 30, height: 24)
         XCTAssertThrowsError(try HostInputGate.check(click, menu, start: true, pointerCheck: true,
                                                      point: CGPoint(x: 110, y: 10)))
@@ -307,10 +310,13 @@ final class HostInputTests: XCTestCase {
             })
         XCTAssertFalse(outcome.completed)
         XCTAssertEqual(outcome.stopReason, "lease_lost")
-        XCTAssertEqual(outcome.released, 1)
-        guard case .button(.left, false, _, _, _) = poster.posted.last else {
-            return XCTFail("the held button must be released last")
-        }
+        // A drag in progress is cancelled: Escape, back to the press point, release there.
+        XCTAssertEqual(outcome.released, 4)
+        let origin = CGPoint(x: 100.25, y: 0.25)
+        XCTAssertEqual(Array(poster.posted.suffix(4)), [
+            .key(CGKeyCode(kVK_Escape), down: true, modifier: false, flags: []),
+            .key(CGKeyCode(kVK_Escape), down: false, modifier: false, flags: []),
+            .drag(.left, origin, flags: []), .button(.left, down: false, at: origin, clicks: 1, flags: [])])
         XCTAssertFalse(poster.posted.contains(.button(.left, down: false, at: CGPoint(x: 125.25, y: 0.25), clicks: 1,
                                                       flags: [])))
     }

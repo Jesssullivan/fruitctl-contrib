@@ -470,7 +470,10 @@ enum HostInputGate {
     static let systemShortcuts: [[String]] = [["cmd", "tab"], ["cmd", "space"], ["ctrl", "space"],
         ["cmd", "alt", "escape"], ["ctrl", "cmd", "q"], ["cmd", "shift", "q"], ["cmd", "alt", "shift", "q"],
         ["ctrl", "f2"], ["ctrl", "f3"], ["ctrl", "up"], ["ctrl", "down"], ["ctrl", "left"], ["ctrl", "right"],
-        ["cmd", "alt", "d"], ["cmd", "`"], ["ctrl", "cmd", "space"], ["cmd", "shift", "/"]]
+        ["cmd", "alt", "d"], ["cmd", "`"], ["ctrl", "cmd", "space"], ["cmd", "shift", "/"],
+        ["cmd", "shift", "tab"], ["cmd", "f5"], ["cmd", "alt", "f5"], ["cmd", "shift", "3"], ["cmd", "shift", "4"],
+        ["cmd", "shift", "5"], ["ctrl", "alt", "cmd", "8"], ["ctrl", "cmd", "f"], ["cmd", "alt", "h"],
+        ["cmd", "alt", "m"]]
 
     static func isSystemShortcut(_ keys: [String]) -> Bool {
         let flags = keys.dropLast().compactMap { HostKeyMap.modifier($0)?.flag }
@@ -514,7 +517,7 @@ enum HostInputGate {
                 || owner.bundleID.map(panelServices.contains) == true || menuBar
             guard acting else { throw HostInputError.windowMismatch }
             // The Apple menu holds Sleep, Lock Screen and Log Out.
-            if menuBar, let point, environment.appleMenuFrame?.contains(point) == true {
+            if menuBar, let point, environment.appleMenuFrame?.contains(point) ?? true {
                 throw HostInputError.windowMismatch
             }
         }
@@ -536,7 +539,8 @@ enum HostInputGate {
         if start, request.policy == .yield {
             // Without a tap that sees keys, operator typing during a key or
             // type action cannot be told from the Host's own (review B2).
-            if !request.kind.pointer, environment.monitorMode != "event_tap" {
+            if environment.monitorMode == "event_times"
+                || (!request.kind.pointer && environment.monitorMode != "event_tap") {
                 throw HostInputError.monitorUnavailable
             }
             if let age = environment.operatorInputAge, age < request.operatorIdleMilliseconds {
@@ -600,6 +604,9 @@ final class HostInputSession {
     /// Quit and signals release them synchronously through `releaseHeld`.
     private var heldButtons: [HostMouseButton: CGPoint] = [:]
     private var heldKeys: [(code: CGKeyCode, modifier: Bool)] = []
+    /// A held button that has dragged is cancelled, never dropped where the
+    /// pointer happens to be: Escape, then back to its press point.
+    private var dragged: Set<HostMouseButton> = []
 
     /// Releases every held button and key at the current pointer location,
     /// never moving the pointer. Returns how many events it posted.
@@ -607,9 +614,18 @@ final class HostInputSession {
     func releaseHeld() -> Int {
         var released = 0
         let here = CGEvent(source: nil)?.location
-        for (button, point) in heldButtons {
-            if poster.post(.button(button, down: false, at: here ?? point, clicks: 1, flags: [])) { released += 1 }
+        let escape = CGKeyCode(kVK_Escape)
+        for (button, origin) in heldButtons {
+            if dragged.contains(button) {
+                if poster.post(.key(escape, down: true, modifier: false, flags: [])) { released += 1 }
+                if poster.post(.key(escape, down: false, modifier: false, flags: [])) { released += 1 }
+                if poster.post(.drag(button, origin, flags: [])) { released += 1 }
+                if poster.post(.button(button, down: false, at: origin, clicks: 1, flags: [])) { released += 1 }
+            } else if poster.post(.button(button, down: false, at: here ?? origin, clicks: 1, flags: [])) {
+                released += 1
+            }
         }
+        dragged.removeAll()
         for key in heldKeys.reversed() {
             if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
         }
@@ -637,7 +653,7 @@ final class HostInputSession {
         let started = now()
         var sampledAt: UInt64?
         var outcome = Outcome()
-        heldButtons.removeAll(); heldKeys.removeAll()
+        heldButtons.removeAll(); heldKeys.removeAll(); dragged.removeAll()
         func stop(_ reason: String) {
             outcome.stopReason = reason
             outcome.released += releaseHeld()
@@ -677,8 +693,8 @@ final class HostInputSession {
             monitor.notePosted(step.kinds, at: now())
             switch step {
             case .button(let button, true, let at, _, _): heldButtons[button] = at
-            case .button(let button, false, _, _, _): heldButtons[button] = nil
-            case .drag(let button, let at, _): heldButtons[button] = at
+            case .button(let button, false, _, _, _): heldButtons[button] = nil; dragged.remove(button)
+            case .drag(let button, _, _): dragged.insert(button)
             case .key(let code, true, let modifier, _): heldKeys.append((code, modifier))
             case .key(let code, false, _, _): heldKeys.removeAll { $0.code == code }
             default: break
@@ -779,10 +795,16 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
     private var tapThread: Thread?
     /// Re-reads the tap: one macOS disabled and could not re-enable no
     /// longer counts, and the time attribution covers every kind again.
+    /// A tap found disabled is re-enabled but reports `event_times` for
+    /// this read, since events during the outage were missed (review N4).
+    /// The keyboard grant is re-read every time.
     var mode: String {
         guard let tap else { return "event_times" }
-        if !CGEvent.tapIsEnabled(tap: tap) { CGEvent.tapEnable(tap: tap, enable: true) }
-        return CGEvent.tapIsEnabled(tap: tap) ? tapMode : "event_times"
+        guard CGEvent.tapIsEnabled(tap: tap) else {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            return "event_times"
+        }
+        return CGPreflightListenEventAccess() ? "event_tap" : "event_tap_pointer"
     }
 
     init(clock: @escaping () -> UInt64) { self.clock = clock }
@@ -838,10 +860,10 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
     /// Time-based attribution for the kinds a tap does not cover.
     private func timedForeign(now: UInt64) -> UInt64? {
         let keyboard: [CGEventType] = [.keyDown, .keyUp, .flagsChanged]
-        let kinds: [CGEventType] = mode == "event_tap" ? [] : mode == "event_tap_pointer" ? keyboard : Self.kinds
+        let current = mode
+        let kinds: [CGEventType] = current == "event_tap" ? [] : current == "event_tap_pointer" ? keyboard : Self.kinds
         lock.lock(); let own = ownPostAt; lock.unlock()
         var latest: UInt64?
-        let mode = self.mode
         for kind in kinds {
             // The combined session table covers device input and every
             // posting process, remote-control clients included.

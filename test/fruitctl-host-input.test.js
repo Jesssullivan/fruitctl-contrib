@@ -100,11 +100,17 @@ test('key_type text is chunked without splitting characters and CR becomes newli
     // A newline ends its request; the Host re-checks focus before 'b'.
     assert.deepEqual(chunks, ['🎸'.repeat(32), '🎸'.repeat(8) + 'a\n', 'b']);
     assert.equal(typed.result.host_input.posted_events, 9);
+    // Chunks also stay within the Host's UTF-16 budget.
+    const before = inputs(host).length;
+    await executor.execute([{ action: 'key_type', text: '👩‍👩‍👧'.repeat(32) }]);
+    assert.ok(inputs(host).slice(before).every(params => params.text.length <= 200));
+    await assert.rejects(executor.execute([{ action: 'key_type', text: 'a' + '\u0301'.repeat(80) }]),
+      error => isPreAdmissionRefusal(error) && error.code === 'invalid_input');
     // A ZWJ sequence is one grapheme and is never split across requests.
     const family = '👩‍👩‍👧';
     await executor.execute([{ action: 'key_type', text: 'x'.repeat(31) + family + 'y' }]);
-    assert.deepEqual(inputs(host).slice(3).map(params => params.text), ['x'.repeat(31) + family, 'y']);
-    assert.equal(host.requests.filter(request => request.action === 'capture').length, 2);
+    assert.deepEqual(inputs(host).slice(-2).map(params => params.text), ['x'.repeat(31) + family, 'y']);
+    assert.equal(host.requests.filter(request => request.action === 'capture').length, 3);
   } finally { await executor.close(); }
 });
 
@@ -185,10 +191,12 @@ test('a stop after some events reports input_interrupted with the count and neve
   try {
     const [stopped] = await executor.execute([{ action: 'key_type', text: 'x'.repeat(70) }]);
     assert.equal(stopped.error.code, 'input_interrupted');
-    assert.deepEqual(stopped.error.data, { reason: 'operator_input_detected', posted_events: 7, released_events: 1 });
-    // The third chunk is never sent, and no readback claims success.
+    const { readback, ...data } = stopped.error.data;
+    assert.deepEqual(data, { reason: 'operator_input_detected', posted_events: 7, released_events: 1 });
+    // The third chunk is never sent; the partial input is read back.
+    assert.match(readback.image, /^iVBOR/);
     assert.equal(inputs(host).length, 2);
-    assert.equal(host.requests.some(request => request.action === 'capture'), false);
+    assert.equal(host.requests.filter(request => request.action === 'capture').length, 1);
     assert.equal(executor.failed, undefined);
   } finally { await executor.close(); }
 });
@@ -212,5 +220,17 @@ test('MCP vnc_command returns the readback image and typed input refusals', asyn
     const refusedKey = await session.command({ action: 'key_tap', key: 'a' });
     assert.equal(refusedKey.isError, true);
     assert.equal(refusedKey.structuredContent.error.code, "secure_input_active");
+  } finally { await executor.close(); }
+});
+
+test('MCP shows the readback image of an interrupted input beside its typed error', async () => {
+  const { executor } = await executorFor({ answer: () => ({ posted_events: 2, completed: false,
+    stop_reason: 'input_target_mismatch' }) });
+  try {
+    const result = await new McpSession(executor).command({ action: 'mouse_double_click', x: 3, y: 4 });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.error.code, 'input_interrupted');
+    assert.equal(result.structuredContent.error.data.readback.image, undefined);
+    assert.ok(result.content.some(block => block.type === 'image'));
   } finally { await executor.close(); }
 });

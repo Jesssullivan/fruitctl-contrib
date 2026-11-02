@@ -435,14 +435,15 @@ on this route.
 | Key combinations macOS or the Dock handle: app and Space switching, Spotlight, input sources, force quit, lock, log out | Host | `input_system_shortcut` |
 | Typing needs a readable focused text input of the target. A newline or tab ends its request | Host | `input_focus_unavailable` |
 | Consent and authorization dialog owners | Host | `human_consent_required` |
-| Operator input: `yield` refuses or stops, `assert` continues and counts. `yield` key and text input need the keyboard tap | Host | `operator_input_detected`, `operator_input_monitor_unavailable` |
+| Operator input: `yield` refuses or stops, `assert` continues and counts. `yield` needs a live event tap, and the keyboard tap for key and text input | Host | `operator_input_detected`, `operator_input_monitor_unavailable` |
 | The local Fruitctl menu is open | Host, every event | the action stops |
 | `activate_app` waits for 2 s of operator idle under either policy | Host | `operator_input_detected` |
 
 A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
-pressed, at the current pointer position, then reports `input_interrupted` with
-the count it posted. Stop and Quit release held input at once. When the lease
+pressed, then reports `input_interrupted` with the count it posted and a
+readback frame. A drag in progress is cancelled with Escape and released at its
+press point, never dropped where the pointer is. Stop and Quit release held input at once. When the lease
 itself ends mid-action, the reply names the count and the lane retires. Nothing
 is replayed. A completed action returns one fresh Host frame, taken at least
 150 ms after its last event, as its readback.
