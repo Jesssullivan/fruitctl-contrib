@@ -66,13 +66,20 @@ export function validateActionParameters(input) {
     zoom: ['x', 'y', 'width', 'height'], wait_for_stable: ['stable_ms', 'timeout_ms'],
     expect_change: ['x', 'y', 'width', 'height'],
     click_element: ['ref'], focus_element: ['ref'],
+    logic_document: ['ref', 'expected_pid', 'expected_birth_us'],
   }[input.action] || [];
   for (const field of required) {
     if (input[field] === undefined) throw new Error(`Missing ${field} for ${input.action}`);
   }
-  if (input.ref !== undefined && (input.action === 'click_element' || input.action === 'focus_element') &&
+  if (input.ref !== undefined && (input.action === 'click_element' || input.action === 'focus_element' || input.action === 'logic_document') &&
       !AX_ELEMENT_REF.test(input.ref)) {
     throw new Error(`${input.action} takes an element ref from ax_snapshot`);
+  }
+  if (input.action === 'logic_document' &&
+      (!Number.isSafeInteger(input.expected_pid) || input.expected_pid <= 0 || input.expected_pid > 2147483647 ||
+       !Number.isSafeInteger(input.expected_birth_us) || input.expected_birth_us <= 0 ||
+       Number(input.ref.split(':')[1]) !== input.expected_pid)) {
+    throw new Error('logic_document requires a matching positive process and birth binding');
   }
   if (input.action === 'type_secret' && input.ref !== undefined && !SECRET_NAME.test(input.ref)) {
     throw new Error('type_secret takes an allowlisted secret name');
@@ -160,6 +167,7 @@ export function vncCommandTool() {
       '  detect_elements                         → OCR text detection with bounding boxes',
       '  ax_snapshot    {depth?, focused_app?, menu_extras?} → Host route only: live Accessibility',
       '                                            tree with role/label/value/frame and element refs',
+      '  logic_document {ref, expected_pid, expected_birth_us} → Host: read a current Logic window document URL; no reopen authority',
       '  click_element  {ref}                    → Host route only: AXPress a ref from the latest',
       '                                            ax_snapshot; result names the path and verified',
       '  focus_element  {ref}                    → Host route only: focus a ref (AXFocused)',
@@ -179,7 +187,7 @@ export function vncCommandTool() {
         'mouse_click', 'mouse_double_click', 'mouse_move', 'hover', 'nudge',
         'mouse_drag', 'scroll',
         'key_tap', 'key_combo', 'key_type', 'paste', 'type_secret', 'clipboard_read',
-        'detect_elements', 'ax_snapshot', 'click_element', 'focus_element',
+        'detect_elements', 'ax_snapshot', 'logic_document', 'click_element', 'focus_element',
         'configure', 'get_timing',
         'wait', 'health', 'shutdown',
         'triple_click', 'cursor_position', 'hold_key', 'mouse_down', 'mouse_up',
@@ -197,6 +205,9 @@ export function vncCommandTool() {
       keys: z.array(z.string()).optional().describe('Array of key names for combo (e.g. ["cmd","shift","3"])'),
       text: z.string().optional().describe('Text to type or paste'),
       ref: commandRef(),
+      expected_pid: z.number().int().positive().max(2147483647).optional().describe('logic_document: expected canonical Logic PID'),
+      expected_birth_us: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()
+        .describe('logic_document: expected process launch time, Unix microseconds'),
       direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
       amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
       ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),

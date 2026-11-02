@@ -64,6 +64,8 @@ protocol HostAXNode {
     func liveState() -> HostAXLiveRead
     /// Exactly one Accessibility call; no synthetic events are posted.
     func perform(_ operation: HostAXOperation) -> HostAXPerformResult
+    /// Narrow read-only Logic window document observation. Never reads a title.
+    func logicDocument(expectedPID: pid_t, expired: () -> Bool) -> HostLogicDocumentRead
 }
 
 struct HostAXApplication {

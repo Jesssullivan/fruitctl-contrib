@@ -123,6 +123,7 @@ connection's lease, ends.
 | `release_activity` | `session_id`; releases only this connection's activity and hides the indicator. |
 | `capture` / `screenshot` | `session_id`, optional `max_dimension` (256–4096; default 1280), optional `format` (`png` when absent, or `jpeg` at quality 0.85 for model-facing frames, D38), and optional `reply_part_bytes` (16 KiB–1 MiB) to split the image across part lines. Requires the same configured display and a live ready lease. Returns a complete image with `mimeType`, display mapping metadata and `host_stage_ms`. |
 | `ax_snapshot` | `session_id`, optional `depth` (1–12; default 6) and boolean `focused_app` (default `true`: frontmost application only; `false`: every regular visible application). Requires the same live ready lease as capture and the Accessibility grant. Reads the live tree off the main thread within a 200 ms budget, breadth first, at most 1,500 nodes and 200 children per element. Returns readiness plus `ax_snapshot`. |
+| `logic_document` | Explicit read-only observation using `session_id`, the latest snapshot `generation` and AXWindow `ref`, plus `expected_pid` and `expected_birth_us`. Requires the existing ready activity lease and Accessibility trust. Checks the canonical Logic process and current window before and after reading standard `AXDocument`. Missing, unsupported, ambiguous or changed identity remains unqualified. No title fallback or reopening authority. |
 | `ax_action` | `session_id`, `generation` (from the latest `ax_snapshot` of this lease), `ref`, `action` (`press` or `focus`), optional boolean `vnc_fallback`. Requires the same live ready lease, the Accessibility grant and no other capture or AX work in flight. Reads the element off the main thread, re-checks the lease, Stop latch and display, then makes exactly one AX call on the main thread: `AXPress` (or `AXShowMenu` for a menu-bar item without it) or `AXFocused` (or `AXRaise` for a window). It then polls the element for up to 250 ms in total. Returns readiness plus `ax_action`. |
 | `ax_verify` | `session_id`, `generation`, `ref`, `action`, matching the one `ax_action` that returned `vnc_click_required`. Consumes that record and polls the element against its pre-click state. Returns readiness plus `ax_verify: {ref, action, generation, verified}`. |
 | `export_idle_reference` | `instance_id` must match the resident app; `reference_id` must match the transient local-menu arm reported by `health`. Optional display/backend must match configuration. Consumes the arm once and exports one full-native PNG plus a hashed private receipt while naturally idle. Creates no lease, readiness or input observation. |
@@ -248,6 +249,22 @@ slow admission cannot start a capture after that deadline.
 No native idle-reference files have been captured for this implementation yet.
 The optional Host remains outside the public installation/release payload until
 its separately attended qualification passes.
+
+## Logic document observation
+
+`logic_document` reads the standard [AXDocument attribute](https://developer.apple.com/documentation/applicationservices/kaxdocumentattribute).
+It is an opt-in observation, not a recovery action. It accepts no
+application path, attribute name or executable code. The canonical Logic bundle,
+executable and identifier are fixed in the Host. A complete local file URL is
+returned only for a matching current window and process birth. Unqualified
+replies omit the URL. Every reply keeps `reopen_authorized` false.
+
+One observation cannot establish continuous project custody until a later crash.
+A consumer must invalidate ownership on stale or missing observations, navigation,
+untitled projects and ambiguous windows. This source has no reopen consumer.
+Actual Logic attribute support and the updated signed Host require separate native
+qualification. Existing permission for an installed Host does not qualify a new
+helper or replacement artifact. TIN-5384. Lexical: XL-ACC-004.
 
 ## Timing contract
 

@@ -219,11 +219,13 @@ targets:
       - FruitctlHost/HostDisplay.swift
       - FruitctlHost/HostAccessibility.swift
       - FruitctlHost/HostAccessibilityAction.swift
+      - FruitctlHost/HostLogicDocument.swift
       - Tests/FruitctlHostTests.swift
       - Tests/HostIdleReferenceTests.swift
       - Tests/HostSocketTests.swift
       - Tests/HostDisplayAccessibilityTests.swift
       - Tests/HostAccessibilityActionTests.swift
+      - Tests/HostLogicDocumentTests.swift
     settings:
       base:
         ARCHS: arm64

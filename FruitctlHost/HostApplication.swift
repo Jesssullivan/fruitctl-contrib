@@ -541,7 +541,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["idle_reference_exporting"] = .boolean(idleReference.isExporting)
                 status["capabilities"] = .array(["capture", "begin_activity", "renew_activity",
                                                  "release_activity", "export_idle_reference",
-                                                 "ax_snapshot", "ax_action"].map { .string($0) })
+                                                 "ax_snapshot", "ax_action", "logic_document"].map { .string($0) })
                 status["input_service"] = .boolean(false)
                 // Requests on one connection are answered as each completes.
                 status["request_pipelining"] = .boolean(true)
@@ -695,6 +695,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 }
             case "ax_action":
                 return .ok(request, try await axAction(request, connectionID: connectionID))
+            case "logic_document":
+                return .ok(request, try await logicDocument(request, connectionID: connectionID))
             case "ax_verify":
                 return .ok(request, try await axVerify(request, connectionID: connectionID))
             case "export_idle_reference":
@@ -729,6 +731,55 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             return .failure(id: request.id, message: error.rawValue)
         } catch {
             return .failure(id: request.id, message: "host_action_failed")
+        }
+    }
+
+    /// Read one retained canonical Logic document window under the existing AX
+    /// observation lease. This grants no project, save or reopen authority.
+    private func logicDocument(_ request: HostRequest, connectionID: UUID) async throws -> [String: HostValue] {
+        try validateDisplay(request)
+        try requireAvailable()
+        let documentRequest = try HostLogicDocumentRequest.parse(request.params)
+        let session = try request.requiredString("session_id")
+        let displayID = capture.displayID
+        guard let geometry = HostDisplayGeometry.current(displayID) else { throw HostCaptureError.displayUnavailable }
+        let current = try requireAXOwner(session: session, connectionID: connectionID,
+            displayID: displayID, geometry: geometry)
+        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !idleReference.isExporting else {
+            throw HostLeaseError.notReady
+        }
+        guard let target = documentRequest.target(in: axGeneration, session: session,
+            displayGeneration: generation, geometry: geometry) else {
+            return readiness(now: clock.milliseconds(), activity: current).merging(
+                HostLogicDocumentObservation.response(documentRequest, reason: .staleRef)) { _, value in value }
+        }
+        let before = HostLogicProcessBinding.current()
+        if let reason = HostLogicProcessBinding.failure(before, request: documentRequest) {
+            return readiness(now: clock.milliseconds(), activity: current).merging(
+                HostLogicDocumentObservation.response(documentRequest, reason: reason)) { _, value in value }
+        }
+        axSnapshotInProgress = true
+        defer { axSnapshotInProgress = false }
+        do {
+            let deadline = DispatchTime.now().uptimeNanoseconds + HostLogicDocumentObservation.budgetNanoseconds
+            let read = await Task.detached(priority: .userInitiated) {
+                target.node.logicDocument(expectedPID: documentRequest.processID) {
+                    DispatchTime.now().uptimeNanoseconds >= deadline
+                }
+            }.value
+            let owner = try requireAXOwner(session: session, connectionID: connectionID,
+                displayID: displayID, geometry: geometry)
+            guard documentRequest.target(in: axGeneration, session: session,
+                displayGeneration: generation, geometry: geometry) != nil else {
+                return readiness(now: clock.milliseconds(), activity: owner).merging(
+                    HostLogicDocumentObservation.response(documentRequest, reason: .staleRef)) { _, value in value }
+            }
+            let after = HostLogicProcessBinding.current()
+            return readiness(now: clock.milliseconds(), activity: owner).merging(
+                HostLogicDocumentObservation.finish(documentRequest, before: before, after: after, read: read)) { _, value in value }
+        } catch {
+            if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+            throw error
         }
     }
 

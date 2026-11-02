@@ -13,6 +13,7 @@ import { nativeFactory, createBroker, TargetLane } from '../lib/broker/server.mj
 import { BrokerExecutor } from '../lib/broker/client.mjs';
 import { McpSession } from '../lib/mcp/server.js';
 import { ResponseBudget } from '../lib/mcp/protocol.js';
+import { validateActionParameters, vncCommandTool } from '../tools/index.js';
 import { nativeCapabilities, isPreAdmissionRefusal } from '../lib/mcp/capabilities.js';
 
 function crc32(bytes) {
@@ -2195,4 +2196,117 @@ test('Host-only observations bind pixels and AX frames to the Host health geomet
         /Host-only (display|observation) geometry changed/);
     } finally { await executor.close(); }
   }
+});
+
+
+// TIN-5384: observation of one current canonical Logic window, never reopen authority.
+const logicWindowSnapshot = (generation = 19) => axSnapshot({ generation,
+  nodes: [{ ref: 'ax:77:0', parent: null, depth: 0, role: 'AXApplication', frame: null },
+    { ref: 'ax:77:0.0', parent: 'ax:77:0', depth: 1, role: 'AXWindow', frame: null }] });
+const logicDocumentAction = { action: 'logic_document', ref: 'ax:77:0.0', expected_pid: 77,
+  expected_birth_us: 1793600000000000 };
+const logicDocumentHost = ({ outcome = () => ({}), trusted = true,
+  snapshot = logicWindowSnapshot() } = {}) => ({ alter(request, response) {
+  const next = axHost({ trusted, snapshot }).alter(request, response);
+  if (!next?.success) return next;
+  if (request.action === 'health') next.result.capabilities.push('logic_document');
+  if (request.action === 'logic_document') next.result.logic_document = {
+    schema: 'fruitctl.logic-document.v1', qualified: true, reason: 'matched',
+    pid: request.params.expected_pid, birth_us: request.params.expected_birth_us,
+    ref: request.params.ref, generation: request.params.generation,
+    document_url: 'file:///synthetic/Band%20Practice.logicx', reopen_authorized: false, ...outcome(request) };
+  return next;
+} });
+
+test('logic_document publishes specific process-bound arguments and rejects malformed bindings', () => {
+  const schema = vncCommandTool().inputSchema;
+  assert.equal(schema.action.safeParse('logic_document').success, true);
+  assert.equal(schema.expected_birth_us.safeParse(Number.MAX_SAFE_INTEGER + 1).success, false);
+  assert.doesNotThrow(() => validateActionParameters(logicDocumentAction));
+  for (const patch of [{ expected_pid: 78 }, { expected_pid: 0 }, { expected_birth_us: 0 },
+    { expected_birth_us: 1.5 }, { expected_birth_us: Number.MAX_SAFE_INTEGER + 1 }, { ref: 'secret-name' }]) {
+    assert.throws(() => validateActionParameters({ ...logicDocumentAction, ...patch }));
+  }
+  assert.throws(() => validateActionParameters({ action: 'logic_document' }), /Missing ref/);
+});
+
+test('logic_document uses the owned Host observation lease and exact current window generation', async () => {
+  const { executor, vnc, host } = await fixture({ helperOptions: logicDocumentHost() });
+  try {
+    assert.equal(executor.capabilities.actions.includes('logic_document'), true);
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    const [response] = await executor.execute([logicDocumentAction]);
+    assert.equal(response.result.logic_document.document_url, 'file:///synthetic/Band%20Practice.logicx');
+    assert.equal(response.result.logic_document.reopen_authorized, false);
+    const request = host.requests.find(entry => entry.action === 'logic_document');
+    assert.deepEqual({ ref: request.params.ref, generation: request.params.generation,
+      expected_pid: request.params.expected_pid, expected_birth_us: request.params.expected_birth_us },
+    { ref: logicDocumentAction.ref, generation: 19, expected_pid: 77,
+      expected_birth_us: logicDocumentAction.expected_birth_us });
+    assert.ok(request.params.session_id);
+    assert.equal(request.params.capture_backend, 'owned_sck');
+    assert.equal(host.requests[host.requests.indexOf(request) - 1].action, 'renew_activity');
+    assert.equal(vnc.calls.some(action => action.action === 'logic_document'), false);
+  } finally { await executor.close(); }
+});
+
+test('logic_document refuses old Hosts, absent trust, stale refs, app refs and mismatched PID before dispatch', async () => {
+  for (const kind of ['old', 'trust', 'no-snapshot', 'app', 'pid', 'nonwindow']) {
+    const helperOptions = kind === 'old' ? axHost() : logicDocumentHost({ trusted: kind !== 'trust',
+      snapshot: kind === 'nonwindow' ? axSnapshot({ generation: 19 }) : logicWindowSnapshot() });
+    const { executor, host } = await fixture({ helperOptions });
+    try {
+      if (!['no-snapshot', 'trust'].includes(kind)) await executor.execute([{ action: 'ax_snapshot' }]);
+      const action = { ...logicDocumentAction, ...(kind === 'app' ? { ref: 'ax:77:0' } : {}),
+        ...(kind === 'pid' ? { expected_pid: 78 } : {}) };
+      await assert.rejects(executor.execute([action]), error => isPreAdmissionRefusal(error));
+      assert.equal(host.requests.some(entry => entry.action === 'logic_document'), false, kind);
+    } finally { await executor.close(); }
+  }
+});
+
+test('logic_document preserves unqualified unsupported and missing evidence without URL or reopen authority', async () => {
+  for (const reason of ['unsupported', 'missing', 'ambiguous', 'identity_changed', 'stale_ref',
+    'window_unavailable', 'invalid_document_url']) {
+    const { executor } = await fixture({ helperOptions: logicDocumentHost({
+      outcome: () => ({ qualified: false, reason, document_url: undefined }) }) });
+    try {
+      await executor.execute([{ action: 'ax_snapshot' }]);
+      const [response] = await executor.execute([logicDocumentAction]);
+      assert.equal(response.result.logic_document.qualified, false);
+      assert.equal(response.result.logic_document.reason, reason);
+      assert.equal(response.result.logic_document.document_url, undefined);
+      assert.equal(response.result.logic_document.reopen_authorized, false);
+    } finally { await executor.close(); }
+  }
+});
+
+test('logic_document rejects mismatched, forged, oversized and nonlocal document evidence', async () => {
+  for (const patch of [{ pid: 78 }, { birth_us: 1 }, { ref: 'ax:77:0' }, { generation: 20 },
+    { reopen_authorized: true }, { reason: 'unrecognized' }, { qualified: false },
+    { schema: 'other' }, { arbitrary_attribute: 'AXTitle' }, { document_url: 'https://example.invalid/a' },
+    { document_url: 'file://remote.invalid/a.logicx' }, { document_url: 'file:///a.logicx?x=1' },
+    { document_url: 'file:///a.logicx#part' }, { document_url: 'file:///' }, { document_url: 'file://localhost/a.logicx' },
+    { document_url: 'file:///a%00.logicx' }, { document_url: 'file:///a%0A.logicx' },
+    { document_url: 'file:///a%GG.logicx' }, { document_url: 'file:///a%FF.logicx' },
+    { document_url: 'file:///a' + 'x'.repeat(4096) }, { document_url: 'file:///a\nlogicx' },
+    { document_url: undefined }]) {
+    const { executor } = await fixture({ helperOptions: logicDocumentHost({ outcome: () => patch }) });
+    try {
+      await executor.execute([{ action: 'ax_snapshot' }]);
+      await assert.rejects(executor.execute([logicDocumentAction]), /Logic document/);
+    } finally { await executor.close(); }
+  }
+});
+
+
+test('logic_document retires window references when its activity is released', async () => {
+  const { executor, host } = await fixture({ helperOptions: logicDocumentHost() });
+  try {
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    await executor.releaseActivity();
+    await assert.rejects(executor.execute([logicDocumentAction]), error =>
+      isPreAdmissionRefusal(error) && error.code === 'stale_ref');
+    assert.equal(host.requests.some(entry => entry.action === 'logic_document'), false);
+  } finally { await executor.close(); }
 });
