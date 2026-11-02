@@ -390,6 +390,23 @@ reports `release_unconfirmed`, with the sanitized Host cause for diagnosis;
 the target stays revoked and requires operator reconciliation. These source
 diagnostics do not qualify capture or grant macOS permission.
 
+A Host-only target holds no VNC connection, credential or input process, so
+its executor can prove its own release (#159). The Host ends a lease when that
+lease's connection closes. After a failure the broker waits for its own SSH
+child to exit. It then opens one fresh attachment that sends only `health`.
+Release is confirmed when that reply shows no lease, indicator or capture
+readiness. Only this executor's own lease may still be draining, for at most
+the Host's 3-second expiry. Any other session's lease keeps the target latched.
+The probe's own SSH child must exit too. The failure is still reported and the
+executor is never reused. The next owner gets a new executor.
+
+When a latch remains, `fruitctl reconcile --target PROFILE` asks the running
+broker to repeat that proof and clear the latch in place. It prints a JSON
+receipt with `reconciled`, the first cause and the Host's readback, and exits
+1 when the proof fails. A lane with queued work refuses with
+`reconcile_refused`. A VNC lane refuses with `reconcile_unsupported`, because
+its native process needs the reconciled broker restart.
+
 ## Error codes
 
 The native daemon, FruitctlHost, the Darwin broker, the Linux relay and the
@@ -432,6 +449,8 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `ax_action_unsupported` | Host | The element does not offer the action |
 | `credential_unavailable` | broker | The VNC credential provider failed at startup |
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
+| `reconcile_refused` | broker | `fruitctl reconcile` found the lane closing, busy or changed |
+| `reconcile_unsupported` | broker | The latched lane cannot prove its own release; restart the reconciled broker |
 | `operation_failed` | broker | Any other error crossing the broker socket |
 | `broker_unavailable` | client | The broker socket is not reachable |
 | `bridge_unreachable`, `bridge_auth_refused`, `bridge_host_key`, `bridge_command_missing`, `bridge_attach_failed`, `bridge_broker_unavailable` | relay | The SSH bridge (D20) did not deliver the request |
@@ -442,8 +461,15 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 itself. A string code raised by the broker before admission (lane, secret,
 clipboard, sentinel or a Host route check) means nothing was sent and the
 lease is kept. The same code in a FruitctlHost reply, or `display_asleep`
-from an executor, follows an admitted request and retires the lane. Secret
-providers run only after every pre-admission refusal has passed.
+from an executor, follows an admitted request and retires the lane. Four
+FruitctlHost `ax_action` reasons are the exception: `stale_ref`,
+`ax_unreachable`, `ax_action_unsupported` and `human_consent_required`. The
+Host raises them before any Accessibility call that may have acted, and keeps
+its lease. The broker returns them as that action's error response and stops
+the batch there. The lane, lease and executor stay (#159). A Host that predates
+this change ends its lease with the refusal. The broker reads that state from
+`health` and begins a new activity on the next batch. Secret providers run
+only after every pre-admission refusal has passed.
 
 ## FuzzyBot spell
 

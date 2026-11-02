@@ -1693,17 +1693,21 @@ test('element actions refuse before admission without a current ref, a capable H
   } finally { await executor.close(); }
 });
 
-test('Host element refusals keep a typed code and retire the lane with no VNC click', async () => {
+test('Host element refusals keep a typed code as a per-call error with no VNC click or retirement', async () => {
+  // #159: each reason is raised before any AX call that may have acted.
   for (const reason of ['stale_ref', 'ax_unreachable', 'ax_action_unsupported', 'human_consent_required']) {
     const { executor, vnc } = await fixture({ config: { ...configuration(), mapping },
       helperOptions: axActionHost({ refuse: { ax_action: reason } }) });
     try {
       await executor.execute([{ action: 'ax_snapshot' }]);
-      await assert.rejects(executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]), error =>
-        error.code === reason && !isPreAdmissionRefusal(error) && error.message.includes(reason) &&
+      const responses = await executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' },
+        { action: 'mouse_click', x: 1, y: 1 }]);
+      assert.equal(responses.length, 1);
+      const { error } = responses[0];
+      assert.ok(error.code === reason && error.message.includes(reason) &&
         // A consent refusal carries the sentinel's data shape to MCP.
         (reason !== 'human_consent_required' || error.data?.reason === reason));
-      assert.ok(executor.failed);
+      assert.equal(executor.failed, undefined);
       assert.equal(vnc.calls.some(action => action.action === 'mouse_click'), false);
     } finally { await executor.close(); }
   }

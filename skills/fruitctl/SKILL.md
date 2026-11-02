@@ -99,6 +99,10 @@ prompts) did not respond to Accessibility and no click was guessed.
 both, report the failure, or ask the operator before clicking by coordinates.
 `human_consent_required` means the element belongs to a consent or system
 dialog; a human must answer it, so report it and do not click it by coordinates.
+These four codes end the batch, but the session keeps its lease: take a new
+`ax_snapshot` and continue. If a target reports `release_unconfirmed`, the
+operator runs `fruitctl reconcile --target PROFILE` on the broker host. A
+Host-only target clears there; other targets need a reconciled broker restart.
 Use `menu_extras: true` on `ax_snapshot` to reach menu-bar extras and Control
 Center.
 
