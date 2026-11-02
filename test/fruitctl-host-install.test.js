@@ -193,6 +193,49 @@ test('after a remount a mode change is still drift and is not replaced', async t
   assert.equal((await fs.stat(executable(f))).mode & 0o777, 0o700);
 });
 
+test('after a remount a same-byte file replacement is still drift', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  const exe = executable(f), before = await fs.stat(exe), bytes = await fs.readFile(exe), copy = exe + '.copy';
+  await fs.writeFile(copy, bytes, { mode: before.mode & 0o777 }); await fs.utimes(copy, before.atime, before.mtime); await fs.rename(copy, exe);
+  assert.notEqual((await fs.stat(exe)).ino, before.ino);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+  await assert.rejects(install(options(f, b), f.dependencies), /Installed Host drift/);
+});
+
+test('after a remount uninstall removes the receipt-bound Host', async t => {
+  const f = await fixture(t), a = await release(f);
+  await install(options(f, a), f.dependencies); await remounted(f);
+  assert.equal((await uninstall({ appPath: f.appPath }, f.dependencies)).status, 'removed');
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'not-installed');
+});
+
+test('after a remount a failed update restores the prior Host and keeps its receipt', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  const failed = { ...f.dependencies, beforeCommit: async () => { throw new Error('Synthetic commit failure'); } };
+  await assert.rejects(install(options(f, b), failed), /Synthetic commit failure/);
+  assert.deepEqual(await fs.readFile(executable(f)), a.payloads['Contents/MacOS/FruitctlHost'].data);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'installed');
+});
+
+test('an attribute-only change to the staged copy before rename is still refused', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies);
+  const state = path.join(path.dirname(f.appPath), '.FruitctlHost.fruitctl-install');
+  const touched = { ...f.dependencies, isRunning: async () => {
+    for (const name of (await fs.readdir(state)).filter(entry => entry.startsWith('transaction-'))) {
+      const staged = path.join(state, name, HOST, 'Contents/MacOS/FruitctlHost');
+      if (!await fs.lstat(staged).catch(() => null)) continue;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await fs.chmod(staged, (await fs.stat(staged)).mode & 0o777);
+    }
+    return false;
+  } };
+  await assert.rejects(install(options(f, b), touched), /Installed Host differs from staged bytes or identity; recovery unconfirmed: Changed new Host retained/);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+});
+
 test('certificate extraction attaches its optional prefix and verifies the extracted public leaf', async t => {
   const f = await fixture(t), r = await release(f);
   const result = await install(options(f, r), f.dependencies);
