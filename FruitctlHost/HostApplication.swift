@@ -982,7 +982,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 outcome = try await activate(input, lease: leaseCheck, read: read, pause: pause)
             } else {
                 let runner = HostInputSession(poster: inputPoster, environment: read, monitor: inputMonitor,
-                    now: { [clock] in clock.milliseconds() }, sleep: pause)
+                    now: { [clock] in clock.milliseconds() }, sleep: pause, targetFrontmost: {
+                        NSWorkspace.shared.frontmostApplication?.bundleIdentifier == input.target.bundleID })
                 activeInputSession = runner
                 defer { activeInputSession = nil }
                 outcome = try await runner.run(input, steps: steps, lease: leaseCheck)

@@ -443,7 +443,9 @@ A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
 pressed, then reports `input_interrupted` with the count it posted and a
 readback frame. A drag in progress is cancelled with Escape and released at its
-press point, never dropped where the pointer is. Stop and Quit release held input at once. When the lease
+press point, never dropped where the pointer is. Escape is sent only while the
+target is frontmost. Stop and Quit release held input at once; for a drag that
+means up to four events, which move the pointer back to the press point. When the lease
 itself ends mid-action, the reply names the count and the lane retires. Nothing
 is replayed. A completed action returns one fresh Host frame, taken at least
 150 ms after its last event, as its readback.

@@ -592,12 +592,15 @@ final class HostInputSession {
     private let monitor: HostOperatorInputMonitoring
     private let sleep: (UInt64) async -> Void
     private let now: () -> UInt64
+    /// Escape cancels a drag only in the target; another frontmost app
+    /// could take it as Cancel or leave full screen (review round 3).
+    private let targetFrontmost: @MainActor () -> Bool
 
     init(poster: HostInputPoster, environment: @escaping @MainActor (CGPoint?, Bool) -> HostInputEnvironment,
          monitor: HostOperatorInputMonitoring, now: @escaping () -> UInt64,
-         sleep: @escaping (UInt64) async -> Void) {
+         sleep: @escaping (UInt64) async -> Void, targetFrontmost: @escaping @MainActor () -> Bool = { true }) {
         self.poster = poster; self.environment = environment; self.monitor = monitor
-        self.now = now; self.sleep = sleep
+        self.now = now; self.sleep = sleep; self.targetFrontmost = targetFrontmost
     }
 
     /// Buttons and keys this session pressed and has not released. Stop,
@@ -617,8 +620,10 @@ final class HostInputSession {
         let escape = CGKeyCode(kVK_Escape)
         for (button, origin) in heldButtons {
             if dragged.contains(button) {
-                if poster.post(.key(escape, down: true, modifier: false, flags: [])) { released += 1 }
-                if poster.post(.key(escape, down: false, modifier: false, flags: [])) { released += 1 }
+                if targetFrontmost() {
+                    if poster.post(.key(escape, down: true, modifier: false, flags: [])) { released += 1 }
+                    if poster.post(.key(escape, down: false, modifier: false, flags: [])) { released += 1 }
+                }
                 if poster.post(.drag(button, origin, flags: [])) { released += 1 }
                 if poster.post(.button(button, down: false, at: origin, clicks: 1, flags: [])) { released += 1 }
             } else if poster.post(.button(button, down: false, at: here ?? origin, clicks: 1, flags: [])) {

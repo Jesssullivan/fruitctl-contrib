@@ -234,3 +234,18 @@ test('MCP shows the readback image of an interrupted input beside its typed erro
     assert.ok(result.content.some(block => block.type === 'image'));
   } finally { await executor.close(); }
 });
+
+test('a refusal after earlier text chunks posted reads back the partial input', async () => {
+  let chunk = 0;
+  const { executor, host } = await executorFor({ answer: request =>
+    ++chunk === 2 ? refusal(request, 'input_focus_unavailable') : undefined });
+  try {
+    const [stopped] = await executor.execute([{ action: 'key_type', text: 'name\nmore' }]);
+    assert.equal(stopped.error.code, 'input_interrupted');
+    assert.equal(stopped.error.data.reason, 'input_focus_unavailable');
+    assert.equal(stopped.error.data.posted_events, 3);
+    assert.match(stopped.error.data.readback.image, /^iVBOR/);
+    assert.equal(host.requests.filter(request => request.action === 'capture').length, 1);
+    assert.equal(executor.failed, undefined);
+  } finally { await executor.close(); }
+});
