@@ -29,6 +29,10 @@ test-host-permits node="node":
 test-host-only node="node":
     {{quote(node)}} --test --test-concurrency=1 --test-name-pattern='Host-only' test/fruitctl-host-helper.test.js test/fruitctl-broker.test.js
 
+# Sanitized timing records and unchanged helper deadline failures; mock SSH only.
+test-host-timing node="node":
+    {{quote(node)}} --test --test-concurrency=1 --test-name-pattern='helper timing' test/fruitctl-helper-timing.test.js test/fruitctl-host-helper.test.js
+
 # Offline full-raster fixture and streaming-oracle checks; contacts no desktop.
 test-qualification node="node":
     {{quote(node)}} --test --test-concurrency=1 test/qualification.test.js test/qualification-stream.test.js test/qualification-overlay-gate.test.js test/qualification-live-kit.test.js

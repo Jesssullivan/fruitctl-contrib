@@ -14,6 +14,7 @@ import { BrokerExecutor } from '../lib/broker/client.mjs';
 import { McpSession } from '../lib/mcp/server.js';
 import { ResponseBudget } from '../lib/mcp/protocol.js';
 import { nativeCapabilities, isPreAdmissionRefusal } from '../lib/mcp/capabilities.js';
+import { createHelperTimingDiagnostics } from '../lib/broker/helper-timing.mjs';
 
 function crc32(bytes) {
   let crc = 0xffffffff;
@@ -176,12 +177,14 @@ function helper({ alter, ignoreTerm = false, ignoreKill = false, latency, serial
   } };
 }
 
-async function fixture({ config = configuration(), nativeOptions, helperOptions, now, responseBudgetFactory } = {}) {
+async function fixture({ config = configuration(), nativeOptions, helperOptions, now, responseBudgetFactory,
+  timingDiagnostics } = {}) {
   const vnc = native(nativeOptions);
   const host = helper(helperOptions);
   const executor = await createHostHelperExecutor({ nativeExecutor: vnc, hostHelper: config,
     spawnImpl: host.spawnImpl, ...(now ? { now } : {}),
-    ...(responseBudgetFactory ? { responseBudgetFactory } : {}) });
+    ...(responseBudgetFactory ? { responseBudgetFactory } : {}),
+    ...(timingDiagnostics ? { timingDiagnostics } : {}) });
   return { executor, vnc, host };
 }
 
@@ -189,6 +192,71 @@ const captureDiagnostic = (overrides = {}) => ({ schema: 'fruitctl.host-capture-
   phase: 'capture_image', apple_domain: 'SCStreamErrorDomain', apple_code: -1, ...overrides });
 const refused = (request, message = 'capture_failed', data) => ({ id: request.id, success: false,
   error: { code: -32000, message, ...(data === undefined ? {} : { data }) } });
+
+test('helper timing distinguishes background renewal, release and final health deadlines', async t => {
+  for (const stalledAction of ['renew_activity', 'release_activity', 'health']) {
+    await t.test(stalledAction, async () => {
+      const records = [];
+      let stallRenewal = false, released = false, resolveDeadline;
+      const deadlineObserved = new Promise(resolve => { resolveDeadline = resolve; });
+      const timing = createHelperTimingDiagnostics({ write(record) {
+        records.push(record);
+        if (record.event === 'deadline') resolveDeadline(record);
+      } });
+      const { executor, host } = await fixture({ timingDiagnostics: timing, helperOptions: {
+        alter(request, response) {
+          if (request.action === 'release_activity') released = true;
+          if (request.action === stalledAction &&
+              (stalledAction === 'renew_activity' ? stallRenewal : stalledAction === 'health' ? released : true)) {
+            return null;
+          }
+          return response;
+        },
+      } });
+      try {
+        await executor.execute([{ action: 'screenshot' }]);
+        if (stalledAction === 'renew_activity') {
+          stallRenewal = true;
+          let timeout;
+          try {
+            await Promise.race([deadlineObserved,
+              new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Missing background deadline')), 2500); })]);
+          } finally { clearTimeout(timeout); }
+        }
+        await assert.rejects(executor.release(), /Host-helper receipt deadline exceeded/);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(hostHelperFailureCause(executor.failed), { phase: 'host_helper', reason: 'deadline' });
+        const expired = records.find(record => record.event === 'deadline');
+        assert.equal(expired.action, stalledAction);
+        assert.equal(expired.timeout_ms, 500);
+        assert.equal(expired.deadline_ms, expired.sent_ms + 500);
+        const sent = records.find(record => record.event === 'send' && record.request_id === expired.request_id);
+        assert.equal(sent.operation_id, expired.operation_id);
+        assert.ok(sent.enqueued_ms <= sent.sent_ms);
+        assert.equal(records.find(record => record.event === 'rejected' && record.request_id === expired.request_id).status, 'error');
+        assert.equal(expired.phase, stalledAction === 'renew_activity' ? 'running'
+          : stalledAction === 'release_activity' ? 'release_activity' : 'release_health');
+        if (stalledAction === 'health') assert.ok(host.requests.some(request => request.action === 'release_activity'));
+        assert.doesNotMatch(JSON.stringify(records), /resident-test-app|session_id|challenge|display_id|image|configured-target/);
+      } finally { await executor.close(); }
+    });
+  }
+});
+
+test('helper timing preserves successful request ordering when its sink throws', async () => {
+  const journeys = [];
+  for (const enabled of [false, true]) {
+    const timing = enabled ? createHelperTimingDiagnostics({ write() { throw new Error('sink unavailable'); } }) : undefined;
+    const { executor, host, vnc } = await fixture({ timingDiagnostics: timing });
+    try {
+      await executor.execute([{ action: 'screenshot' }]);
+      await executor.release();
+      journeys.push({ helper: host.requests.map(request => request.action),
+        native: vnc.calls.map(action => action.action), releases: vnc.releases.length });
+    } finally { await executor.close(); }
+  }
+  assert.deepEqual(journeys[1], journeys[0]);
+});
 
 test('only locally sanitized refusals supply diagnostic causes, independent of mutable messages', async () => {
   const { executor } = await fixture({ helperOptions: { alter(request, response) {
