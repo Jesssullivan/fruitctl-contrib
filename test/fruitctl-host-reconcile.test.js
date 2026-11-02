@@ -30,7 +30,7 @@ test('a pre-act AX refusal ends the batch as a per-call error and keeps the lane
       const responses = await executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' },
         { action: 'screenshot' }]);
       assert.equal(responses.length, 1, reason);
-      assert.equal(responses[0].error.code, reason);
+      assert.equal(responses[0].error.data.code, reason);
       assert.match(responses[0].error.message, new RegExp(reason));
       if (reason === 'human_consent_required') assert.equal(responses[0].error.data.reason, reason);
       assert.equal(executor.failed, undefined);
@@ -55,6 +55,15 @@ test('MCP reports a per-call AX refusal with its typed code and the session cont
   try {
     const session = new McpSession(executor);
     await session.command({ action: 'ax_snapshot' });
+    // An older client accepts only integer codes: the wire reply must pass it.
+    const { validateResponse } = await import('../lib/mcp/protocol.js');
+    const legacy = (await import('zod')).z.object({ error: (await import('zod')).z.object({
+      code: (await import('zod')).z.number().int(), message: (await import('zod')).z.string() }).passthrough() });
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    const [wire] = await executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]);
+    assert.equal(legacy.safeParse(wire).success, true);
+    assert.equal(validateResponse(wire).error.code, 'ax_action_unsupported');
+    await session.command({ action: 'ax_snapshot' });
     const refused = await session.command({ action: 'click_element', ref: 'ax:77:0.0' });
     assert.equal(refused.isError, true);
     assert.equal(refused.structuredContent.error.code, 'ax_action_unsupported');
@@ -75,7 +84,7 @@ test('a Host that released its lease with the refusal is begun again by the next
   try {
     await executor.execute([{ action: 'ax_snapshot' }]);
     const [refused] = await executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]);
-    assert.equal(refused.error.code, 'ax_action_unsupported');
+    assert.equal(refused.error.data.code, 'ax_action_unsupported');
     assert.equal(executor.failed, undefined);
     assert.equal(executor.activityActive, false);
     // Refs of the ended lease are gone on both sides.
