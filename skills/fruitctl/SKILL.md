@@ -104,7 +104,13 @@ These four codes end the batch, but the session keeps its lease: take a new
 operator runs `fruitctl reconcile --target PROFILE` on the broker host. A
 Host-only target clears there; other targets need a reconciled broker restart.
 Use `menu_extras: true` on `ax_snapshot` to reach menu-bar extras and Control
-Center.
+Center. When a large window fills the node budget, read one subtree instead:
+`ax_snapshot {root: "menu"}` for an open menu or popup,
+`{root: "focused_window"}`, or `{root: <ref>}`, with `max_nodes` to keep the call
+small. Refs from the subtree work with the element actions. To open a nested
+submenu, try `show_menu_element {ref}`. If the menu does not open, use the
+hover route: `mouse_move` to the centre of the item's `display_frame`, then
+take a new `ax_snapshot {root: "menu"}`.
 
 On a Host-only target with `hostInput`, `mouse_click`, `mouse_double_click`,
 `triple_click`, `mouse_move`, `hover`, `mouse_drag`, `scroll`, `key_tap`,

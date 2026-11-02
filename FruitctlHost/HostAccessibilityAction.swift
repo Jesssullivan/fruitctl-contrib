@@ -18,7 +18,11 @@ enum HostAXActionError: String, Error {
     case consentDialog = "human_consent_required"
 }
 
-enum HostAXActionKind: String { case press, focus }
+enum HostAXActionKind: String {
+    case press, focus
+    /// #158: AXShowMenu only, for elements that open a menu or submenu.
+    case showMenu = "show_menu"
+}
 
 /// The single Accessibility call an action makes. Raw values are AX names.
 enum HostAXOperation: String {
@@ -99,7 +103,9 @@ struct HostAXSnapshotBuild: @unchecked Sendable {
 }
 
 struct HostAXActionRequest: Equatable {
-    static let maximumRefLength = 64
+    /// A subtree snapshot extends its root's path (#158), so refs can be
+    /// deeper than one 12-level snapshot.
+    static let maximumRefLength = 128
     let generation: UInt64
     let ref: String
     let kind: HostAXActionKind
@@ -121,9 +127,18 @@ struct HostAXActionRequest: Equatable {
         return HostAXActionRequest(generation: generation, ref: ref, kind: kind, vncFallback: fallback)
     }
 
+    static let maximumRefComponents = 32
+
+    /// `ax:<pid>:0` then up to 32 `.index` parts of 1 to 3 digits.
     static func validRef(_ ref: String) -> Bool {
-        ref.hasPrefix("ax:") && ref.utf8.count <= maximumRefLength
-            && ref.utf8.dropFirst(3).allSatisfy { ($0 >= 48 && $0 <= 57) || $0 == 46 || $0 == 58 }
+        guard ref.hasPrefix("ax:"), ref.utf8.count <= maximumRefLength else { return false }
+        let parts = ref.dropFirst(3).split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2, (1...10).contains(parts[0].count), parts[0].allSatisfy({ $0.isASCII && $0.isNumber }) else {
+            return false
+        }
+        let path = parts[1].split(separator: ".", omittingEmptySubsequences: false)
+        return path.first == "0" && path.count - 1 <= maximumRefComponents
+            && path.dropFirst().allSatisfy { (1...3).contains($0.count) && $0.allSatisfy({ $0.isASCII && $0.isNumber }) }
     }
 }
 
@@ -222,6 +237,8 @@ enum HostAXActionPlanner {
             if state.focusSettable { return .focus }
             if state.role == "AXWindow", state.actions.contains("AXRaise") { return .raise }
             return nil
+        case .showMenu:
+            return state.actions.contains("AXShowMenu") ? .showMenu : nil
         }
     }
 
@@ -239,8 +256,9 @@ enum HostAXActionPlanner {
     static func plan(_ kind: HostAXActionKind, state: HostAXLiveState, surface: HostAXSurface,
                      geometry: HostDisplayGeometry, remoteViewService: Bool, vncFallback: Bool) throws -> HostAXPlan {
         if let operation = operation(for: kind, state: state, surface: surface) { return .perform(operation) }
+        // A menu that will not open through AX is not clicked blindly.
         return try vncClick(state: state, geometry: geometry, remoteViewService: remoteViewService,
-                            allowed: vncFallback)
+                            allowed: vncFallback && kind != .showMenu)
     }
 }
 
@@ -268,7 +286,7 @@ enum HostAXVerifier {
         case .live(let state):
             switch kind {
             case .focus: return state.focused == true || (operation == .raise && state.main == true)
-            case .press: return Fingerprint(state) != Fingerprint(before)
+            case .press, .showMenu: return Fingerprint(state) != Fingerprint(before)
             }
         }
     }

@@ -5,6 +5,30 @@ import Foundation
 enum HostAccessibilityError: String, Error {
     case permissionRequired = "accessibility_permission_required"
     case applicationUnavailable = "accessibility_application_unavailable"
+    /// The requested subtree root (focused window or open menu) is absent.
+    case rootUnavailable = "accessibility_root_unavailable"
+}
+
+/// Where a snapshot starts (#158). `applications` is the whole tree of each
+/// candidate application; the others read one subtree, so a large window
+/// cannot spend the node budget before an open menu is reached.
+enum HostAXRoot: Equatable {
+    case applications
+    /// An element of the latest snapshot generation of this lease.
+    case ref(String)
+    /// The frontmost application's focused window.
+    case focusedWindow
+    /// The frontmost application's open menu, popup or context menu.
+    case menu
+
+    var name: String {
+        switch self {
+        case .applications: return "applications"
+        case .ref: return "ref"
+        case .focusedWindow: return "focused_window"
+        case .menu: return "menu"
+        }
+    }
 }
 
 /// The bounded request accepted from IPC. depth counts levels below each
@@ -17,6 +41,9 @@ struct HostAXRequest: Equatable {
     /// Adds menu-bar extras (Control Center, SystemUIServer, accessory apps)
     /// and their open menus, popovers and panels as further roots.
     var menuExtras = false
+    var root: HostAXRoot = .applications
+    /// Per-call node cap, at most the snapshot maximum.
+    var maximumNodes = HostAccessibilitySnapshot.maximumNodes
 
     static func parse(_ params: [String: HostValue]) throws -> HostAXRequest {
         var depth = defaultDepth
@@ -36,7 +63,26 @@ struct HostAXRequest: Equatable {
             guard case .boolean(let requested) = value else { throw HostLeaseError.invalidParameters }
             extras = requested
         }
-        return HostAXRequest(depth: depth, focusedApplicationOnly: focused, menuExtras: extras)
+        var root = HostAXRoot.applications
+        if let value = params["root"] {
+            switch value.string {
+            case "focused_window"?: root = .focusedWindow
+            case "menu"?: root = .menu
+            case let ref? where HostAXActionRequest.validRef(ref): root = .ref(ref)
+            default: throw HostLeaseError.invalidParameters
+            }
+            // A subtree belongs to one application; extras are separate roots.
+            guard !extras else { throw HostLeaseError.invalidParameters }
+        }
+        var nodes = HostAccessibilitySnapshot.maximumNodes
+        if let value = params["max_nodes"] {
+            guard let requested = value.integer, (1...HostAccessibilitySnapshot.maximumNodes).contains(requested) else {
+                throw HostLeaseError.invalidParameters
+            }
+            nodes = requested
+        }
+        return HostAXRequest(depth: depth, focusedApplicationOnly: focused, menuExtras: extras, root: root,
+                             maximumNodes: nodes)
     }
 }
 
@@ -71,6 +117,9 @@ struct HostAXApplication {
     let bundleID: String?
     let name: String?
     let root: HostAXNode
+    /// A subtree root keeps its own structural ref, so its descendants'
+    /// refs name the same paths as in a whole-application snapshot.
+    var rootRef: String? = nil
 }
 
 /// Real provider: AXUIElement. Tests supply a fake provider and nodes.
@@ -84,6 +133,13 @@ protocol HostAccessibilityProvider {
     func isSystemRemoteViewService(processID: pid_t) -> Bool
     /// The process's executable name, or nil when it cannot be read.
     func executableName(processID: pid_t) -> String?
+    /// The frontmost application's focused window or open menu, with its
+    /// structural ref, or nil when there is none.
+    func subtreeRoot(_ root: HostAXRoot, excluding processID: pid_t) -> HostAXApplication?
+}
+
+extension HostAccessibilityProvider {
+    func subtreeRoot(_ root: HostAXRoot, excluding processID: pid_t) -> HostAXApplication? { nil }
 }
 
 /// Builds the bounded, framebuffer-mapped snapshot. Pure over the provider's
@@ -118,7 +174,7 @@ enum HostAccessibilitySnapshot {
         // one subtree can consume the whole node budget.
         var queue: [(node: HostAXNode, ref: String, parent: String?, depth: Int, owner: Int)] = []
         for (owner, application) in applications.enumerated() {
-            let ref = "ax:\(application.processID):0"
+            let ref = application.rootRef ?? "ax:\(application.processID):0"
             roots.append(.object([
                 "pid": .integer(Int64(application.processID)), "ref": .string(ref),
                 "bundle_id": application.bundleID.map { .string(bounded($0)) } ?? .null,
@@ -149,7 +205,8 @@ enum HostAccessibilitySnapshot {
             "schema": .string(schema), "coordinate_space": .string("framebuffer_pixels"),
             "framebuffer": .object(geometry.metadata), "depth": .integer(Int64(request.depth)),
             "focused_app": .boolean(request.focusedApplicationOnly),
-            "menu_extras": .boolean(request.menuExtras),
+            "menu_extras": .boolean(request.menuExtras), "root": .string(request.root.name),
+            "max_nodes": .integer(Int64(maximumNodes)),
             "applications": .array(roots), "nodes": .array(nodes),
             "node_count": .integer(Int64(nodes.count)), "truncated": .boolean(truncated)]
         if let generation { snapshot["generation"] = .integer(Int64(clamping: generation)) }
@@ -375,6 +432,88 @@ final class HostSystemAccessibilityProvider: HostAccessibilityProvider {
         guard application.activationPolicy != .regular else { return false }
         let bundle = application.bundleIdentifier ?? ""
         return bundle.isEmpty || bundle.hasPrefix("com.apple.")
+    }
+
+    func subtreeRoot(_ root: HostAXRoot, excluding processID: pid_t) -> HostAXApplication? {
+        guard let application = NSWorkspace.shared.frontmostApplication, application.processIdentifier != processID,
+              !application.isTerminated else { return nil }
+        let pid = application.processIdentifier
+        let element = AXUIElementCreateApplication(pid)
+        let target: AXUIElement?
+        switch root {
+        case .focusedWindow: target = Self.element(element, kAXFocusedWindowAttribute)
+        case .menu: target = Self.openMenu(in: element)
+        case .applications, .ref: return nil
+        }
+        guard let target, let path = Self.path(of: target, in: element) else { return nil }
+        let ref = "ax:\(pid):0" + path.map { "." + String($0) }.joined()
+        guard HostAXActionRequest.validRef(ref) else { return nil }
+        return HostAXApplication(processID: pid, bundleID: application.bundleIdentifier, name: application.localizedName,
+                                 root: HostSystemAXNode(element: target), rootRef: ref)
+    }
+
+    private static func element(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func role(_ element: AXUIElement) -> String? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    private static func children(_ element: AXUIElement) -> [AXUIElement] {
+        var values: CFArray?
+        guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0,
+                                             HostAccessibilitySnapshot.maximumChildren, &values) == .success,
+              let items = values as? [AnyObject] else { return [] }
+        return items.compactMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
+    }
+
+    /// The outermost menu around the focused element, else a menu that is a
+    /// child of the application or of its selected menu-bar item.
+    private static func openMenu(in application: AXUIElement) -> AXUIElement? {
+        var cursor = element(application, kAXFocusedUIElementAttribute)
+        var outermost: AXUIElement?
+        for _ in 0..<HostAXRequest.maximumDepth * 2 {
+            guard let current = cursor, let kind = role(current), kind == "AXMenu" || kind == "AXMenuItem" else { break }
+            if kind == "AXMenu" { outermost = current }
+            cursor = element(current, kAXParentAttribute)
+        }
+        if let outermost { return outermost }
+        for child in children(application) {
+            switch role(child) {
+            case "AXMenu"?: return child
+            case "AXMenuBar"?:
+                for item in children(child) {
+                    var selected: AnyObject?
+                    guard AXUIElementCopyAttributeValue(item, kAXSelectedAttribute as CFString, &selected) == .success,
+                          (selected as? NSNumber)?.boolValue == true else { continue }
+                    if let menu = children(item).first(where: { role($0) == "AXMenu" }) { return menu }
+                }
+            default: continue
+            }
+        }
+        return nil
+    }
+
+    /// Child indices from the application element down to `target`, in the
+    /// same order snapshot traversal reads children. Nil when the parent
+    /// chain does not reach the application within the depth bound.
+    private static func path(of target: AXUIElement, in application: AXUIElement) -> [Int]? {
+        var indices: [Int] = []
+        var current = target
+        for _ in 0...32 {
+            if CFEqual(current, application) { return indices.reversed() }
+            guard let parent = element(current, kAXParentAttribute),
+                  let index = children(parent).firstIndex(where: { CFEqual($0, current) }) else { return nil }
+            indices.append(index)
+            current = parent
+        }
+        return nil
     }
 
     func executableName(processID: pid_t) -> String? {

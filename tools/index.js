@@ -50,12 +50,12 @@ const secretRef = () => z.string().regex(SECRET_NAME).optional()
   .describe('type_secret: operator-allowlisted secret name (never the secret itself)');
 // An element ref from ax_snapshot. The two forms are disjoint (a secret name
 // has no colon), and each action accepts only its own.
-const AX_ELEMENT_REF = /^ax:[0-9]{1,10}:0(\.[0-9]{1,3}){0,12}$/;
+const AX_ELEMENT_REF = /^ax:[0-9]{1,10}:0(\.[0-9]{1,3}){0,32}$/;
 // #157: the application a Host-route input action is for, by bundle ID.
 const appBundle = () => z.string().regex(/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/).max(255).optional()
   .describe('Host route input: target application bundle ID (default: the only hostInput application)');
 const commandRef = () => z.string()
-  .regex(/^(?:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}|ax:[0-9]{1,10}:0(?:\.[0-9]{1,3}){0,12})$/).optional()
+  .regex(/^(?:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}|ax:[0-9]{1,10}:0(?:\.[0-9]{1,3}){0,32})$/).max(128).optional()
   .describe('type_secret: operator-allowlisted secret name (never the secret itself); ' +
     'click_element / focus_element: an element ref from the latest ax_snapshot');
 
@@ -71,12 +71,12 @@ export function validateActionParameters(input) {
     hold_key: ['key', 'duration_ms'], mouse_down: ['x', 'y'],
     zoom: ['x', 'y', 'width', 'height'], wait_for_stable: ['stable_ms', 'timeout_ms'],
     expect_change: ['x', 'y', 'width', 'height'],
-    click_element: ['ref'], focus_element: ['ref'],
+    click_element: ['ref'], focus_element: ['ref'], show_menu_element: ['ref'],
   }[input.action] || [];
   for (const field of required) {
     if (input[field] === undefined) throw new Error(`Missing ${field} for ${input.action}`);
   }
-  if (input.ref !== undefined && (input.action === 'click_element' || input.action === 'focus_element') &&
+  if (input.ref !== undefined && ['click_element', 'focus_element', 'show_menu_element'].includes(input.action) &&
       !AX_ELEMENT_REF.test(input.ref)) {
     throw new Error(`${input.action} takes an element ref from ax_snapshot`);
   }
@@ -175,6 +175,8 @@ export function vncCommandTool() {
       '  click_element  {ref}                    → Host route only: AXPress a ref from the latest',
       '                                            ax_snapshot; result names the path and verified',
       '  focus_element  {ref}                    → Host route only: focus a ref (AXFocused)',
+      '  show_menu_element {ref}                 → Host route only: open its menu or submenu (AXShowMenu)',
+      '  ax_snapshot {root?, max_nodes?}         → root: focused_window, menu, or a ref, to read one subtree',
       '  activate_app   {app?}                   → Host route only: make the target app frontmost',
       'On a Host-only target with hostInput, FruitctlHost posts the pointer and key actions itself',
       '(optional app names the target). It refuses when that app is not frontmost, secure input is on,',
@@ -195,7 +197,7 @@ export function vncCommandTool() {
         'mouse_click', 'mouse_double_click', 'mouse_move', 'hover', 'nudge',
         'mouse_drag', 'scroll',
         'key_tap', 'key_combo', 'key_type', 'paste', 'type_secret', 'clipboard_read',
-        'detect_elements', 'ax_snapshot', 'click_element', 'focus_element', 'activate_app',
+        'detect_elements', 'ax_snapshot', 'click_element', 'focus_element', 'show_menu_element', 'activate_app',
         'configure', 'get_timing',
         'wait', 'health', 'shutdown',
         'triple_click', 'cursor_position', 'hold_key', 'mouse_down', 'mouse_up',
@@ -228,6 +230,9 @@ export function vncCommandTool() {
         .describe('wait_for_stable: give up with a typed stable_timeout error after this long'),
       depth: z.number().int().min(1).max(12).optional().describe('ax_snapshot levels below each application (default 6)'),
       focused_app: z.boolean().optional().describe('ax_snapshot: frontmost application only (default true)'),
+      root: z.string().regex(/^(?:focused_window|menu|ax:[0-9]{1,10}:0(?:\.[0-9]{1,3}){0,32})$/).max(128).optional()
+        .describe('ax_snapshot: read one subtree: focused_window, menu (the open menu) or an element ref'),
+      max_nodes: z.number().int().min(1).max(1500).optional().describe('ax_snapshot: node cap for this call (default 1500)'),
       menu_extras: z.boolean().optional()
         .describe('ax_snapshot: also read menu-bar extras, Control Center and their open menus (default false)'),
       format: z.enum(['jpeg', 'png']).optional()

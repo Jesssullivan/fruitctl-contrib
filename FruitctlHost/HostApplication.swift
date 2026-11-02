@@ -717,8 +717,25 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 guard let geometry = HostDisplayGeometry.current(displayID) else {
                     throw HostCaptureError.displayUnavailable
                 }
-                let applications = accessibility.applications(focusedOnly: axRequest.focusedApplicationOnly,
+                // #158: a subtree root is resolved before any traversal. These
+                // refusals act on nothing, so the lease stays.
+                let applications: [HostAXApplication]
+                switch axRequest.root {
+                case .applications:
+                    applications = accessibility.applications(focusedOnly: axRequest.focusedApplicationOnly,
                                                               menuExtras: axRequest.menuExtras, excluding: getpid())
+                case .ref(let ref):
+                    guard let latest = axGeneration, latest.sessionID == session,
+                          latest.displayGeneration == generation, latest.geometry == geometry,
+                          let element = latest.elements[ref] else { throw HostAXActionError.staleRef }
+                    applications = [HostAXApplication(processID: element.processID, bundleID: element.bundleID,
+                                                      name: nil, root: element.node, rootRef: ref)]
+                case .focusedWindow, .menu:
+                    guard let root = accessibility.subtreeRoot(axRequest.root, excluding: getpid()) else {
+                        throw HostAccessibilityError.rootUnavailable
+                    }
+                    applications = [root]
+                }
                 guard !applications.isEmpty else { throw HostAccessibilityError.applicationUnavailable }
                 axSnapshotInProgress = true
                 defer { axSnapshotInProgress = false }
@@ -730,7 +747,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                     let number = axGenerationCounter &+ 1
                     let built = try await Task.detached(priority: .userInitiated) {
                         try HostAccessibilitySnapshot.buildRetained(applications: applications, request: axRequest,
-                            geometry: geometry, generation: number) { DispatchTime.now().uptimeNanoseconds >= deadline }
+                            geometry: geometry, generation: number, maximumNodes: axRequest.maximumNodes) {
+                            DispatchTime.now().uptimeNanoseconds >= deadline }
                     }.value
                     let completedAt = clock.milliseconds()
                     let current = try lease.requireOwner(sessionID: session, connectionID: connectionID,

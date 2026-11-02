@@ -51,7 +51,7 @@ test('baseline actions are the vnc_command surface older backends shipped', () =
   // Newer methods stay outside the baseline: only advertised metadata enables them.
   assert.deepEqual([...surface].filter(action => !BASELINE_ACTIONS.has(action)).sort(),
     ['activate_app', 'ax_snapshot', 'click_element', 'clipboard_read', 'cursor_position', 'focus_element', 'hold_key', 'mouse_down',
-      'mouse_up', 'triple_click', 'type_secret', 'wait_for_stable', 'zoom']);
+      'mouse_up', 'show_menu_element', 'triple_click', 'type_secret', 'wait_for_stable', 'zoom']);
 });
 
 test('Anthropic actions translate to Fruitctl actions with scaled coordinates', () => {
