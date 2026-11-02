@@ -1704,7 +1704,8 @@ test('Host element refusals keep a typed code as a per-call error with no VNC cl
         { action: 'mouse_click', x: 1, y: 1 }]);
       assert.equal(responses.length, 1);
       const { error } = responses[0];
-      assert.ok(error.code === reason && error.message.includes(reason) &&
+      // On the wire: -32020 with the typed code in data.code (old clients).
+      assert.ok(error.code === -32020 && error.data.code === reason && error.message.includes(reason) &&
         // A consent refusal carries the sentinel's data shape to MCP.
         (reason !== 'human_consent_required' || error.data?.reason === reason));
       assert.equal(executor.failed, undefined);

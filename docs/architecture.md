@@ -469,7 +469,7 @@ route raises `-32013` itself with the daemon's meaning. Broker codes are
 strings. This table is the register: a new code is added here in the same
 change that raises it, and `test/fruitctl-error-codes.test.js` fails on a code
 in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
-`-32009` and `-32015` upward are unassigned.
+`-32009`, `-32015` to `-32019` and `-32021` upward are unassigned.
 
 | Code | Raised by | Meaning |
 | --- | --- | --- |
@@ -483,6 +483,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `-32012` | daemon | Observation condition unmet: `stable_timeout`, `change_not_observed` |
 | `-32013` | daemon, Host route | `input_not_ready`: settle time does not fit the deadline; no event written |
 | `-32014` | daemon | `clipboard_unavailable`: `clipboard_read` failed or is off; `data.reason` |
+| `-32020` | Host route | A per-call Host refusal on the wire; its typed code is `data.code`, which MCP reports as the error code |
 | `unsupported_action` | broker, MCP | The backend does not offer the action |
 | `unsupported_on_route` | broker | The action exists only on the other route |
 | `unsupported_expectation` | MCP | The step cannot carry the requested `expect` |

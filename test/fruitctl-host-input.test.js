@@ -173,7 +173,7 @@ test('a Host refusal before the first event is a per-call error that keeps the l
     try {
       const responses = await executor.execute([{ action: 'mouse_click', x: 1, y: 1 }, { action: 'screenshot' }]);
       assert.equal(responses.length, 1);
-      assert.equal(responses[0].error.code, reason);
+      assert.equal(responses[0].error.data.code, reason);
       assert.equal(executor.failed, undefined);
       assert.equal(host.requests.some(request => request.action === 'capture'), false);
       refuse = false;
@@ -190,9 +190,10 @@ test('a stop after some events reports input_interrupted with the count and neve
       operator_input_events: 1 } : undefined });
   try {
     const [stopped] = await executor.execute([{ action: 'key_type', text: 'x'.repeat(70) }]);
-    assert.equal(stopped.error.code, 'input_interrupted');
+    assert.equal(stopped.error.data.code, 'input_interrupted');
     const { readback, ...data } = stopped.error.data;
-    assert.deepEqual(data, { reason: 'operator_input_detected', posted_events: 7, released_events: 1 });
+    assert.deepEqual(data, { reason: 'operator_input_detected', posted_events: 7, released_events: 1,
+      code: 'input_interrupted' });
     // The third chunk is never sent; the partial input is read back.
     assert.match(readback.image, /^iVBOR/);
     assert.equal(inputs(host).length, 2);
@@ -241,7 +242,7 @@ test('a refusal after earlier text chunks posted reads back the partial input', 
     ++chunk === 2 ? refusal(request, 'input_focus_unavailable') : undefined });
   try {
     const [stopped] = await executor.execute([{ action: 'key_type', text: 'name\nmore' }]);
-    assert.equal(stopped.error.code, 'input_interrupted');
+    assert.equal(stopped.error.data.code, 'input_interrupted');
     assert.equal(stopped.error.data.reason, 'input_focus_unavailable');
     assert.equal(stopped.error.data.posted_events, 3);
     assert.match(stopped.error.data.readback.image, /^iVBOR/);

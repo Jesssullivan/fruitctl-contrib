@@ -65,7 +65,7 @@ test('an unavailable root is a per-call error that keeps the lane', async () => 
   try {
     const responses = await executor.execute([{ action: 'ax_snapshot', root: 'menu' }, { action: 'screenshot' }]);
     assert.equal(responses.length, 1);
-    assert.equal(responses[0].error.code, 'accessibility_root_unavailable');
+    assert.equal(responses[0].error.data.code, 'accessibility_root_unavailable');
     assert.equal(executor.failed, undefined);
     refuse = false;
     const [read] = await executor.execute([{ action: 'ax_snapshot' }]);
