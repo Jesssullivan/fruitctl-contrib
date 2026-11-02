@@ -12,7 +12,7 @@ import { hostOnlyProfile, hostSequence, refusal } from './host-mock.mjs';
 const LOGIC = 'com.apple.logic10';
 const policy = (extra = {}) => ({ applications: [LOGIC], ...extra });
 
-function inputHost({ health = {}, answer, capabilities = ['input'] } = {}) {
+function inputHost({ health = {}, answer, capabilities = ['input', 'capture_scope'] } = {}) {
   return hostSequence({ capabilities, health: { input_enabled: true, input_post_permission: true,
     operator_input_monitor: 'event_tap', ...health }, alter(request, response) {
     if (request.action !== 'input' || !response.success) return response;

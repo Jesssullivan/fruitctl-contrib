@@ -227,6 +227,7 @@ targets:
       - Tests/HostAccessibilityActionTests.swift
       - Tests/HostInputTests.swift
       - Tests/HostAXSubtreeTests.swift
+      - Tests/HostCaptureScopeTests.swift
     settings:
       base:
         ARCHS: arm64

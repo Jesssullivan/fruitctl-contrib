@@ -594,7 +594,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["idle_reference_exporting"] = .boolean(idleReference.isExporting)
                 status["capabilities"] = .array(["capture", "begin_activity", "renew_activity",
                                                  "release_activity", "export_idle_reference",
-                                                 "ax_snapshot", "ax_action", "input"].map { .string($0) })
+                                                 "ax_snapshot", "ax_action", "input", "capture_scope"].map { .string($0) })
                 // #157: input posts CGEvents only under the local opt-in,
                 // the Accessibility grant and a live, indicated lease.
                 status["input_service"] = .boolean(inputPreferences.isEnabled && HostSystemInputPoster.permitted)
@@ -669,6 +669,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 try requireAvailable()
                 let size = try maximumDimension(request)
                 let format = try imageFormat(request)
+                let scope = try HostCaptureScope.parse(request.params)
                 let session = try request.requiredString("session_id")
                 _ = try lease.requireOwner(sessionID: session, connectionID: connectionID,
                                             displayGeneration: generation, now: now)
@@ -681,7 +682,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 captureInProgress = true
                 defer { captureInProgress = false }
                 do {
-                    let image = try await capture.snapshot(maximumDimension: size, format: format)
+                    let image = try await capture.snapshot(maximumDimension: size, format: format, scope: scope)
                     let completedAt = clock.milliseconds()
                     let current = try lease.requireOwner(sessionID: session, connectionID: connectionID,
                         displayGeneration: generation, now: completedAt)
@@ -693,6 +694,9 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                     }
                     return .ok(request, readiness(now: completedAt, activity: current)
                         .merging(image.metadata) { _, imageValue in imageValue })
+                } catch HostCaptureError.targetUnavailable {
+                    // No target window is running; nothing was captured (#163).
+                    throw HostCaptureError.targetUnavailable
                 } catch {
                     if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
                     throw error

@@ -8,6 +8,8 @@ enum HostCaptureError: String, Error {
     case incompleteImage = "incomplete_capture"
     case captureFailed = "capture_failed"
     case imageEncodingFailed = "image_encoding_failed"
+    /// A target-scoped capture found none of its applications running (#163).
+    case targetUnavailable = "capture_target_unavailable"
 }
 
 enum HostCapturePhase: String, Encodable, Equatable {
