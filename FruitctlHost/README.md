@@ -181,6 +181,11 @@ discards the generation. `ax_action` fails with typed messages:
   those; this holds even when the broker's desktop-state sentinel is off or
   read nothing.
 
+These four refusals are raised before any Accessibility call that may have
+acted. The lease and the snapshot generation stay, so the next request on the
+same lease can act or snapshot again. Any other `ax_action` failure ends the
+connection's lease.
+
 When the element definitely cannot act (no applicable action, or
 `kAXErrorActionUnsupported` / `kAXErrorAttributeUnsupported`) and a click is
 safe, `ax_action` returns `path: "vnc_click_required"` with `fallback_point` in

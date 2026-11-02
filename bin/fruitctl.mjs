@@ -56,7 +56,7 @@ configPath = values.config || defaultConfigPath();
   if (values.secrets && command !== 'doctor') throw new Error('--secrets is supported only by doctor');
   if ((values.once || values.health) && command !== 'relay') throw new Error('--once and --health are supported only by relay');
   if (values.help || !command) {
-    process.stdout.write('Fruitctl\n\nCommands: mcp, broker, relay, attach, install, doctor, rollback, uninstall, journal\n' +
+    process.stdout.write('Fruitctl\n\nCommands: mcp, broker, relay, attach, install, doctor, rollback, uninstall, journal, reconcile\n' +
       '  mcp --target PROFILE [--socket PATH]\n' +
       '  broker [--config PATH] [--socket PATH]\n' +
       '  relay --bridge USER@HOST [--socket PATH] [--remote-socket PATH] [--remote-command PATH] [--once]\n' +
@@ -67,6 +67,7 @@ configPath = values.config || defaultConfigPath();
       '  doctor --secrets [--target PROFILE] [--config PATH]\n' +
       '  rollback|uninstall --agent AGENT [--scope user|project] [--project-dir PATH] [--install-root ABSOLUTE_DIRECTORY]\n' +
       '  journal verify FILE\n' +
+      '  reconcile --target PROFILE [--socket PATH]\n' +
       '\n--install-root selects Fruitctl runtime/state/launcher storage; registration still follows scope and project/user configuration.\n' +
       'Repeat the selected root for doctor, rollback and uninstall. Explicit-root installation requires explicit scope; omitted root preserves legacy paths.\n' +
       'Install requires explicit --version TAG. Doctor writes JSON: exit 1 for drift, 0 for configured or not-installed.\n' +
@@ -75,6 +76,8 @@ configPath = values.config || defaultConfigPath();
       'From a Linux seat, doctor --macos runs the probe on the Darwin bridge (--bridge or FRUITCTL_BRIDGE_HOST), which owns the profile.\n' +
       'The relay reconnects with capped backoff and answers clients with typed bridge errors; --once exits on the first bridge loss.\n' +
       'relay --health prints the running relay\'s state as JSON and exits 0 only while its bridge is up.\n' +
+      'reconcile asks the running broker to prove a latched Host-only release and clear it; it prints a JSON receipt\n' +
+      'and exits 1 when the target cannot prove it (VNC lanes still need a reconciled broker restart).\n' +
       'Add --timings to installer commands for bounded aggregate timings; default output is unchanged.\n');
   } else if (command === 'broker') {
     const { createBroker } = await import('../lib/broker/server.mjs');
@@ -116,6 +119,18 @@ configPath = values.config || defaultConfigPath();
     if (!values.mux) throw new Error('Attach requires --mux; agents use mcp --target PROFILE');
     const { attachMux } = await import('../lib/broker/relay.mjs');
     await attachMux({ socketPath });
+  } else if (command === 'reconcile') {
+    const { BrokerExecutor } = await import('../lib/broker/client.mjs');
+    const executor = new BrokerExecutor({ socketPath, target: values.target });
+    try {
+      await executor.opened;
+      const receipt = await executor.reconcile();
+      process.stdout.write(JSON.stringify(receipt ?? { reconciled: false }, null, 2) + '\n');
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ reconciled: false, ...(typeof error.code === 'string' ? { code: error.code } : {}),
+        message: String(error.message).slice(0, 512) }, null, 2) + '\n');
+      process.exitCode = 1;
+    } finally { await executor.close(); }
   } else if (command === 'mcp') {
     const { BrokerExecutor } = await import('../lib/broker/client.mjs');
     const { startMcp } = await import('../lib/mcp/server.js');

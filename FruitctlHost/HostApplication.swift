@@ -814,6 +814,11 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                               geometry: geometry)
             return readiness(now: clock.milliseconds(), activity: current)
                 .merging(["ax_action": .object(outcome.metadata)]) { _, value in value }
+        } catch let refusal as HostAXActionError {
+            // Every typed refusal is raised before an Accessibility call that
+            // may have acted, so the lease and generation stay. The broker
+            // reports a per-call error instead of retiring the lane (#159).
+            throw refusal
         } catch {
             if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
             throw error
