@@ -212,3 +212,31 @@ test('private Host binding resolves before lane creation and refuses identity or
   await fs.writeFile(configPath, JSON.stringify(document));
   await assert.rejects(loadConfig(configPath), /one absolute file/);
 });
+
+
+test('Host-only profile validation forbids every VNC/provider policy and accepts a private binding', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-host-only-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const config = path.join(directory, 'config.json');
+  const helper = { sshHost: 'configured-native-target',
+    command: ['/Applications/FruitctlHost.app/Contents/MacOS/FruitctlHost', '--stdio'], displayId: 42 };
+  const profile = { transport: 'host-only', targetId: 'native-target', hostHelper: helper };
+  const write = async value => { await fs.writeFile(config, JSON.stringify({ schema: 'fruitctl.config.v1',
+    targets: { native: value } })); return config; };
+  assert.deepEqual((await loadConfig(await write(profile))).targets.native, profile);
+  const binding = path.join(directory, 'binding.json');
+  await fs.writeFile(binding, JSON.stringify({ schema: 'fruitctl.host-binding.v1',
+    targetId: 'native-target', hostHelper: helper }), { mode: 0o600 });
+  const bound = await loadConfig(await write({ transport: 'host-only', targetId: 'native-target',
+    hostHelperFile: binding }));
+  assert.deepEqual(bound.targets.native.hostHelper, helper);
+  for (const key of ['vnc', 'daemonPath', 'credentialFile', 'input', 'clipboard', 'secrets']) {
+    const value = key === 'credentialFile' ? '/absent-secret' : key === 'daemonPath' ? '/absent-daemon' : {};
+    await assert.rejects(loadConfig(await write({ ...profile, [key]: value })), /Host-only transport forbids/);
+  }
+  await assert.rejects(loadConfig(await write({ ...profile,
+    credential: { provider: 'file', path: '/absent-secret' } })), /Host-only transport forbids credential/);
+  await assert.rejects(loadConfig(await write({ ...profile, hostHelper: undefined })), /Host binding/);
+  await assert.rejects(loadConfig(await write({ ...profile, transport: 'host-onyl' })), /Invalid target transport/);
+  await assert.rejects(loadConfig(await write({ ...profile, hostHelper: { ...helper, mapping: {} } })), /forbids VNC mapping/);
+});
