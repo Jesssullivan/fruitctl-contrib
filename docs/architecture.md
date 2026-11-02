@@ -500,6 +500,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `stale_ref` | Host route, Host | The element ref is not in the latest `ax_snapshot` |
 | `ax_unreachable` | Host | The element can no longer be reached |
 | `ax_action_unsupported` | Host | The element does not offer the action |
+| `accessibility_root_unavailable` | Host | The `ax_snapshot` root (focused window or open menu) is absent; nothing was read |
 | `credential_unavailable` | broker | The VNC credential provider failed at startup |
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
 | `invalid_input` | broker | A Host input action's coordinates, keys, text or scroll are invalid; nothing was sent |
