@@ -152,6 +152,90 @@ test('a real stable app lifecycle preserves modes, rolls back actual two version
   }
 });
 
+// A reboot or remount renumbers st_dev, and macOS attribute writes move the
+// bundle root's ctime. Rewrite the stored receipt and cache trees the way such
+// a restart leaves them.
+async function remounted(f) {
+  const state = path.join(path.dirname(f.appPath), '.FruitctlHost.fruitctl-install'), receiptPath = path.join(state, 'current.json');
+  const shift = tree => { for (const identity of Object.values(tree.identities)) identity.device = String(BigInt(identity.device) + 7n); tree.identities[''].ctimeNs = String(BigInt(tree.identities[''].ctimeNs) + 1n); };
+  const receipt = JSON.parse(await fs.readFile(receiptPath)); shift(receipt.tree); await fs.writeFile(receiptPath, JSON.stringify(receipt) + '\n');
+  const entryPath = path.join(state, 'cache-' + receipt.cacheKey, 'entry.json');
+  await fs.chmod(entryPath, 0o600); const entry = JSON.parse(await fs.readFile(entryPath)); shift(entry.tree);
+  await fs.writeFile(entryPath, JSON.stringify(entry) + '\n'); await fs.chmod(entryPath, 0o400);
+}
+
+test('a post-reboot device and root ctime change keeps the install upgradable and rollback intact', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'installed');
+  assert.equal((await install(options(f, b), f.dependencies)).status, 'installed');
+  assert.deepEqual(await fs.readFile(executable(f)), b.payloads['Contents/MacOS/FruitctlHost'].data);
+  await remounted(f);
+  assert.equal((await rollback({ appPath: f.appPath }, f.dependencies)).version, a.version);
+  assert.deepEqual(await fs.readFile(executable(f)), a.payloads['Contents/MacOS/FruitctlHost'].data);
+});
+
+test('after a remount a same-size content change is still drift and is not replaced', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  const bytes = await fs.readFile(executable(f)); bytes[0] ^= 1; await fs.writeFile(executable(f), bytes);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+  await assert.rejects(install(options(f, b), f.dependencies), /Installed Host drift/);
+  assert.deepEqual(await fs.readFile(executable(f)), bytes);
+});
+
+test('after a remount a mode change is still drift and is not replaced', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  await fs.chmod(executable(f), 0o700);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+  await assert.rejects(install(options(f, b), f.dependencies), /Installed Host drift/);
+  assert.equal((await fs.stat(executable(f))).mode & 0o777, 0o700);
+});
+
+test('after a remount a same-byte file replacement is still drift', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  const exe = executable(f), before = await fs.stat(exe), bytes = await fs.readFile(exe), copy = exe + '.copy';
+  await fs.writeFile(copy, bytes, { mode: before.mode & 0o777 }); await fs.utimes(copy, before.atime, before.mtime); await fs.rename(copy, exe);
+  assert.notEqual((await fs.stat(exe)).ino, before.ino);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+  await assert.rejects(install(options(f, b), f.dependencies), /Installed Host drift/);
+});
+
+test('after a remount uninstall removes the receipt-bound Host', async t => {
+  const f = await fixture(t), a = await release(f);
+  await install(options(f, a), f.dependencies); await remounted(f);
+  assert.equal((await uninstall({ appPath: f.appPath }, f.dependencies)).status, 'removed');
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'not-installed');
+});
+
+test('after a remount a failed update restores the prior Host and keeps its receipt', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies); await remounted(f);
+  const failed = { ...f.dependencies, beforeCommit: async () => { throw new Error('Synthetic commit failure'); } };
+  await assert.rejects(install(options(f, b), failed), /Synthetic commit failure/);
+  assert.deepEqual(await fs.readFile(executable(f)), a.payloads['Contents/MacOS/FruitctlHost'].data);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'installed');
+});
+
+test('an attribute-only change to the staged copy before rename is still refused', async t => {
+  const f = await fixture(t), a = await release(f), b = await release(f, 'v0.1.0-private.2');
+  await install(options(f, a), f.dependencies);
+  const state = path.join(path.dirname(f.appPath), '.FruitctlHost.fruitctl-install');
+  const touched = { ...f.dependencies, isRunning: async () => {
+    for (const name of (await fs.readdir(state)).filter(entry => entry.startsWith('transaction-'))) {
+      const staged = path.join(state, name, HOST, 'Contents/MacOS/FruitctlHost');
+      if (!await fs.lstat(staged).catch(() => null)) continue;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await fs.chmod(staged, (await fs.stat(staged)).mode & 0o777);
+    }
+    return false;
+  } };
+  await assert.rejects(install(options(f, b), touched), /Installed Host differs from staged bytes or identity; recovery unconfirmed: Changed new Host retained/);
+  assert.equal((await doctor({ appPath: f.appPath }, f.dependencies)).status, 'drift');
+});
+
 test('certificate extraction attaches its optional prefix and verifies the extracted public leaf', async t => {
   const f = await fixture(t), r = await release(f);
   const result = await install(options(f, r), f.dependencies);
