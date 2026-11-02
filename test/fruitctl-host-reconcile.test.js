@@ -47,6 +47,26 @@ test('a pre-act AX refusal ends the batch as a per-call error and keeps the lane
   }
 });
 
+test('MCP reports a per-call AX refusal with its typed code and the session continues', async () => {
+  let refuse = true;
+  const { executor } = await executorFor({ alter(request, response) {
+    return request.action === 'ax_action' && refuse ? refusal(request, 'ax_action_unsupported') : response;
+  } });
+  try {
+    const session = new McpSession(executor);
+    await session.command({ action: 'ax_snapshot' });
+    const refused = await session.command({ action: 'click_element', ref: 'ax:77:0.0' });
+    assert.equal(refused.isError, true);
+    assert.equal(refused.structuredContent.error.code, 'ax_action_unsupported');
+    const queued = await session.queue({ actions: [{ action: 'wait', ms: 50 }] });
+    assert.equal(queued.isError, undefined);
+    refuse = false;
+    const pressed = await session.command({ action: 'click_element', ref: 'ax:77:0.0' });
+    assert.equal(pressed.isError, undefined);
+    assert.equal(executor.failed, undefined);
+  } finally { await executor.close(); }
+});
+
 test('a Host that released its lease with the refusal is begun again by the next batch', async () => {
   const { executor, host } = await executorFor({
     releaseOn: request => request.action === 'ax_action',
