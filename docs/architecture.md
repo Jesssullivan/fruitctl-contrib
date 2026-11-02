@@ -406,6 +406,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `-32700` | daemon | Request line is not JSON |
 | `-32600` | daemon, Host | Invalid request, including one over the line limit |
 | `-32601` | daemon, Host | Unknown method (Host: `unsupported_host_action`) |
+| `-32602`, `-32603` | Host-route diagnostics | Native reply codes retained in fixed first-cause metadata. Emission by the shipped controller remains unverified |
 | `-32000` | daemon, Host | Untyped failure; no `data` |
 | `-32010` | daemon | `stale_screen`: no fresh complete frame; `data.reason`, `data.diagnostics` |
 | `-32011` | daemon | Input refused before any event; `data.reason` |

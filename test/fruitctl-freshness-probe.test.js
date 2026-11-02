@@ -73,7 +73,16 @@ for line in sys.stdin:
     if request["method"] != "screenshot":
         sys.exit(9)  # Observation only: anything else is a runner defect.
     count += 1
-    wire(0, "bridge")
+    if scene != "missingwire":
+        wire(0, "bridge")
+    if scene == "extrawire":
+        wire(0, "bridge")
+    if scene == "malformed-stdout":
+        sys.stdout.write("{bad}\n"); sys.stdout.flush(); sys.exit(0)
+    if scene == "truncated-stdout":
+        sys.stdout.write('{"id":'); sys.stdout.flush(); sys.exit(0)
+    if scene == "oversized-stderr":
+        sys.stderr.write("x" * 65537 + "\n"); sys.stderr.flush()
     if scene == "stale":
         out({"id": request["id"], "error": {"code": -32010,
              "message": "No fresh complete framebuffer update within 5 seconds",
@@ -91,6 +100,10 @@ for line in sys.stdin:
          "scaledHeight": 53, "connectionGeneration": 1, "allocation": 1,
          "provenance": {"source": "in_session", "request_mode": mode,
                         "requests": {"full": 1, "incremental": 1 if mode == "stream" else 0}}}})
+if scene == "tailwire":
+    # An unassigned final wire request, including an unterminated stderr tail.
+    sys.stderr.write("[RFB-WIRE] ms=1 dir=c2s type=3 incremental=0 length=10 origin=bridge")
+    sys.stderr.flush()
 `;
 
 const SHORT = ['--gap-seconds', '0', '--idle-seconds', '0', '--long-idle-seconds', '0',
@@ -222,6 +235,98 @@ test('P0 and P1 pass against a fresh fake controller and keep only hashes', () =
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
+});
+
+const delayedLedger = String.raw`
+import importlib.util, json, os, pathlib, sys, threading, time
+spec = importlib.util.spec_from_file_location('owned_probe', pathlib.Path(sys.argv[1]))
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+class DelayedLedgerSession(probe.DaemonSession):
+    def __init__(self, *args, **kwargs):
+        self.allow_stderr = threading.Event()
+        self.screenshots = 0
+        super().__init__(*args, **kwargs)
+    # Reproduce a scheduler pause of the former independent stderr reader.
+    # A coordinated reader cannot pause stderr independently of its replies.
+    def _stderr(self):
+        if not self.allow_stderr.wait(5):
+            raise RuntimeError('fixture never reached its second screenshot')
+        super()._stderr()
+    def rpc(self, method, timeout):
+        if method == 'screenshot':
+            self.screenshots += 1
+            if self.screenshots == 2:
+                self.allow_stderr.set()
+        return super().rpc(method, timeout)
+output = pathlib.Path(sys.argv[3]); output.mkdir()
+argv = [sys.argv[2], '--rfb-request-mode', 'on-demand', '--rfb-wire-ledger', '--password-fd', '3']
+session = DelayedLedgerSession(0, argv, b'owned-repro-fixture', time.monotonic, output, 2)
+records = []
+try:
+    session.await_ready()
+    for index in range(2):
+        records.append(probe.observe(session, index, {'phase': 'warm', 'session': 0, 'waitSeconds': 0},
+            0, {'capture_timeout': 2, 'save_images': False}, output))
+finally:
+    session.allow_stderr.set()
+    session.close()
+probe.attribute_ledger(records, [session])
+print(json.dumps({'fullRequests': [r['ledger']['fullRequests'] for r in records],
+                  'wireTotal': probe.summarize_ledger(session.ledger)['fullBridge'],
+                  'ok': [r['ok'] for r in records], 'exit': session.process.returncode}))
+`;
+
+test('a paused stderr reader cannot move one warm request into the next capture', () => {
+  const w = workspace();
+  try {
+    const result = spawnSync('python3', ['-I', '-B', '-c', delayedLedger, probe, w.daemon,
+      path.join(w.dir, 'delayed')], { encoding: 'utf8', timeout: 10000,
+      env: { PATH: process.env.PATH,
+        FAKE_CREDENTIAL_SHA256: createHash('sha256').update('owned-repro-fixture').digest('hex') } });
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.deepEqual(report.ok, [true, true]);
+    assert.equal(report.wireTotal, 2);
+    assert.equal(report.exit, 0);
+    assert.deepEqual(report.fullRequests, [1, 1]);
+  } finally { rmSync(w.dir, { recursive: true, force: true }); }
+});
+
+test('wire attribution independently refuses missing, extra and trailing requests', () => {
+  const w = workspace();
+  try {
+    for (const [scene, requests] of [['missingwire', 0], ['extrawire', 2], ['tailwire', 1]]) {
+      const out = path.join(w.dir, scene);
+      const result = runProbe(['--probe', 'P1', '--daemon', w.daemon, '--output-dir', out, ...SHORT],
+        { env: { FAKE_SCENE: scene } });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      const receipt = receiptOf(out);
+      assert.equal(receipt.verdict.result, 'FAIL');
+      assert.deepEqual(receipt.captures.map(capture => capture.ledger.fullRequests), Array(4).fill(requests));
+      assert.ok(receipt.captures.every(capture => capture.provenance.requests.full === 1),
+        'independent wire evidence must disagree with the unchanged self-reported count');
+      assert.equal(receipt.sessions[0].exitCode, 0);
+      if (scene === 'tailwire') {
+        assert.equal(receipt.sessions[0].ledger.fullBridge, 5);
+        assert.match(receipt.verdict.reasons[0], /5 full wire requests, 4 assigned/);
+      }
+    }
+  } finally { rmSync(w.dir, { recursive: true, force: true }); }
+});
+
+test('the coordinated reader refuses malformed and incomplete stdout and oversized stderr', () => {
+  const w = workspace();
+  try {
+    for (const scene of ['malformed-stdout', 'truncated-stdout', 'oversized-stderr']) {
+      const result = runProbe(['--probe', 'P1', '--daemon', w.daemon, '--output-dir', path.join(w.dir, scene),
+        ...SHORT], { env: { FAKE_SCENE: scene } });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      const receipt = receiptOf(path.join(w.dir, scene));
+      assert.equal(receipt.verdict.result, 'FAIL');
+      assert.ok(receipt.captures.some(capture => !capture.ok));
+    }
+  } finally { rmSync(w.dir, { recursive: true, force: true }); }
 });
 
 test('typed stale_screen and gate leaks are probe failures, not crashes', () => {

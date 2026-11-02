@@ -93,7 +93,7 @@ The receipt is `freshness-probe-receipt.json`, written to a new
 - the verified build receipt hash and `sourceRevision`;
 - for each capture: `t`, `latency_ms`, `sha256`, `ok`, `reason`, the
   `provenance` returned by the controller, the health read before it, and the
-  windowed ledger counts;
+  ledger counts between the matched health and screenshot response prefixes;
 - for each connection: ledger totals, gate leaks, `vnc_state` changes and
   exit code;
 - for P-eq, `eqComparison` with the immediate and settled hashes and

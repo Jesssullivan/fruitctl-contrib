@@ -173,3 +173,42 @@ test('config rejects malformed target inventory', async t => {
   await fs.writeFile(config, JSON.stringify({ schema: 'fruitctl.config.v1', targets: [] }));
   await assert.rejects(loadConfig(config), /target profiles/);
 });
+
+test('private Host binding resolves before lane creation and refuses identity or custody drift', async t => {
+  const { directory } = await fixture(t);
+  const configPath = path.join(directory, 'config.json');
+  const bindingPath = path.join(directory, 'host-binding.json');
+  const helper = { sshHost: 'fixture-target', command: ['/Applications/FruitctlHost.app/Contents/MacOS/FruitctlHost', '--stdio'],
+    displayId: 1 };
+  const document = { schema: 'fruitctl.config.v1', targets: {
+    desktop: { targetId: 'fixture-desktop', hostHelperFile: bindingPath }
+  } };
+  const binding = { schema: 'fruitctl.host-binding.v1', targetId: 'fixture-desktop', hostHelper: helper };
+  const write = async value => fs.writeFile(bindingPath, JSON.stringify(value), { mode: 0o600 });
+  await fs.writeFile(configPath, JSON.stringify(document));
+  await write(binding);
+  assert.deepEqual((await loadConfig(configPath)).targets.desktop.hostHelper, helper);
+  await write({ ...binding, targetId: 'another-desktop' });
+  await assert.rejects(loadConfig(configPath), /identity or schema/);
+  await write({ ...binding, targets: { injected: {} } });
+  await assert.rejects(loadConfig(configPath), /identity or schema/);
+  await write({ ...binding, hostHelper: { ...helper, command: ['/usr/bin/open', '--stdio'] } });
+  await assert.rejects(loadConfig(configPath), /Invalid host-helper/);
+  await write(binding);
+  await fs.chmod(bindingPath, 0o644);
+  await assert.rejects(loadConfig(configPath), /private user-owned regular file/);
+  await fs.chmod(bindingPath, 0o600);
+  await fs.chmod(directory, 0o755);
+  await assert.rejects(loadConfig(configPath), /directory must be private/);
+  await fs.chmod(directory, 0o700);
+  const original = path.join(directory, 'original.json');
+  await fs.rename(bindingPath, original);
+  await fs.symlink(original, bindingPath);
+  await assert.rejects(loadConfig(configPath));
+  await fs.unlink(bindingPath);
+  await assert.rejects(loadConfig(configPath), { code: 'ENOENT' });
+  await write(binding);
+  document.targets.desktop.hostHelper = helper;
+  await fs.writeFile(configPath, JSON.stringify(document));
+  await assert.rejects(loadConfig(configPath), /one absolute file/);
+});

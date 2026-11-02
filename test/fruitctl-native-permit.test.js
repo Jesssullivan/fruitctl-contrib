@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { crc32, deflateSync } from 'node:zlib';
-import { createHostHelperExecutor } from '../lib/broker/host-helper.mjs';
+import { createHostHelperExecutor, hostHelperFailureCause } from '../lib/broker/host-helper.mjs';
 import { createNativeExecutor } from '../lib/mcp/native.js';
 import { vncCommandTool, actionQueueTool } from '../tools/index.js';
 
@@ -78,9 +78,9 @@ async function handle(request) {
       fail(request, 'Native permit binding or sequence changed'); return;
     }
     pending = { binding: params, start: now(), challenge: randomUUID() };
-    if (mode === 'late-begin') {
+    if (mode === 'late-begin' || mode === 'too-late-begin') {
       setTimeout(() => { emit({ id: request.id, result: receipt(pending) });
-        emit({ method: 'ready', params: { scaledWidth: 8, scaledHeight: 4 } }); record('native-late-ack'); }, 120);
+        emit({ method: 'ready', params: { scaledWidth: 8, scaledHeight: 4 } }); record('native-late-ack'); }, mode === 'too-late-begin' ? 550 : 120);
       return;
     }
     emit({ id: request.id, result: receipt(pending) }); return;
@@ -121,7 +121,7 @@ async function main() {
   for await (const bytes of fs.createReadStream(null, { fd: 3 })) credential = Buffer.concat([credential, bytes]);
   if (credential.readUInt32BE(0) !== credential.length - 4 || Object.hasOwn(process.env, 'VNC_PASSWORD')) process.exit(70);
   credential.fill(0); record('native-started');
-  if (mode === 'late-begin') process.on('SIGTERM', () => { record('native-owned-term'); setTimeout(() => process.exit(0), 200); });
+  if (mode === 'late-begin' || mode === 'too-late-begin') process.on('SIGTERM', () => { record('native-owned-term'); setTimeout(() => process.exit(0), 200); });
   emit({ method: 'ready', params: { scaledWidth: 8, scaledHeight: 4 } });
   for await (const line of readline.createInterface({ input: process.stdin })) handle(JSON.parse(line)).catch(() => process.exit(70));
 }
@@ -412,4 +412,19 @@ test('expired native permit rejects a fresh challenge and old grant without succ
     challenge: begun.result.challenge, lease_remaining_ms: 3000 });
   assert.match(replay.error.message, /expired|replayed/);
   assert.ok(!(await events()).some(event => event.event === 'native-input-event'));
+});
+
+
+test('the actual bounded native control deadline keeps its first cause after a late ACK', async t => {
+  const owned = await fixture(t, 'too-late-begin');
+  const executor = await owned.host();
+  await assert.rejects(executor.execute([{ action: 'key_tap', key: 'enter' }]), /deadline/);
+  assert.deepEqual(hostHelperFailureCause(executor.failed), { phase: 'native_permit_begin', reason: 'deadline' });
+  await waitUntil(async () => (await owned.events()).some(event => event.event === 'native-late-ack'), 'late ACK fixture did not answer');
+  assert.equal(owned.native.isReady, false);
+  assert.equal(owned.native.terminal, true);
+  assert.equal((await owned.events()).some(event => event.event === 'native-input-event'), false);
+  const before = (await owned.events()).length;
+  await assert.rejects(executor.execute([{ action: 'key_tap', key: 'tab' }]), /deadline/);
+  assert.equal((await owned.events()).length, before);
 });

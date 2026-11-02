@@ -53,6 +53,15 @@ let
     };
   };
   sentinelOffDocument = (builtins.fromJSON sentinelOff.home.file."Library/Application Support/fruitctl/config.json".text).targets.desktop;
+  privateHostDocument = (builtins.fromJSON (evaluate "aarch64-darwin" {
+    enable = true;
+    targets.desktop = {
+      targetId = "fixture-desktop";
+      credentialFile = "/Users/fruitctl-test/private/password";
+      daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon";
+      hostHelperFile = "/Users/fruitctl-test/private/host-binding.json";
+    };
+  }).home.file."Library/Application Support/fruitctl/config.json".text).targets.desktop;
   attachmentRejected = builtins.all (extra: rejected "aarch64-darwin" {
     enable = true;
     targets.desktop = {
@@ -212,6 +221,23 @@ let
   noProfilesRejected = !(builtins.tryEval (evaluate "aarch64-darwin" {
     enable = true;
   }).programs.fruitctl.mcpServers).success;
+  requestModeSettings = mode: {
+    enable = true;
+    targets.desktop = {
+      credentialFile = "/Users/fruitctl-test/private/password";
+      daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon";
+      vnc.requestMode = mode;
+    };
+  };
+  requestModeDocument = mode: (builtins.fromJSON
+    (evaluate "aarch64-darwin" (requestModeSettings mode)).home.file."Library/Application Support/fruitctl/config.json".text).targets.desktop.vnc;
+  invalidRequestModeRejected = builtins.all (mode:
+    !(builtins.tryEval (requestModeDocument mode)).success) [ "poll" "" true 1 ];
+  linuxRequestModeRejected = builtins.all (mode: rejected "x86_64-linux" {
+    enable = true;
+    bridgeHost = "darwin-bridge";
+    targets.desktop.vnc.requestMode = mode;
+  }) [ "stream" "on-demand" ];
   invalidCaptureTimeoutRejected = !(builtins.tryEval (evaluate "aarch64-darwin" {
     enable = true;
     targets.desktop = {
@@ -289,6 +315,13 @@ assert nativeController.containsHost == false;
 assert nativeController.releaseMetadata.notarization.status == "Accepted";
 assert nativeDocument.targets.desktop.daemonPath == "${nativeController}/bin/claude-kvm-daemon";
 assert !(nativeDocument.targets.desktop ? hostHelper);
+assert privateHostDocument.hostHelperFile == "/Users/fruitctl-test/private/host-binding.json";
+assert !(privateHostDocument ? hostHelper);
+assert rejected "x86_64-linux" {
+  enable = true;
+  bridgeHost = "darwin-bridge";
+  targets.desktop.hostHelperFile = "/home/fruitctl-test/private/host-binding.json";
+};
 assert builtins.elem nativeController.drvPath (map (package: package.drvPath) nativeDarwin.home.packages);
 assert !(nativeDarwin.launchd.agents ? fruitctl-broker);
 assert !disabledDarwin.programs.fruitctl.enable && disabledDarwin.programs.fruitctl.nativePackage == null;
@@ -331,6 +364,11 @@ assert !(nativeDocument.targets.desktop ? inputSource);
 assert darwinDocument.targets.desktop.vnc.captureTimeoutMs == 12000;
 assert !(nativeDocument.targets.desktop.vnc ? captureTimeoutMs);
 assert invalidCaptureTimeoutRejected && linuxCaptureTimeoutRejected;
+assert (requestModeDocument "stream").requestMode == "stream";
+assert (requestModeDocument "on-demand").requestMode == "on-demand";
+assert !(requestModeDocument null ? requestMode);
+assert !(nativeDocument.targets.desktop.vnc ? requestMode);
+assert invalidRequestModeRejected && linuxRequestModeRejected;
 assert invalidInputSourceRejected;
 assert darwinDocument.targets.desktop.input == { pasteUnmappable = true; };
 assert darwinDocument.targets.desktop.clipboard == { read = true; ttlMs = 60000; };

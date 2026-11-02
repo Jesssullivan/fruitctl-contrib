@@ -814,6 +814,16 @@ test('a Linux seat routes doctor --macos through its Darwin bridge, which owns t
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fruitctl-preflight-bridge-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const absent = path.join(directory, 'absent.json');
+  const remoteProfile = path.join(directory, 'remote-profile.json');
+  await fs.writeFile(remoteProfile, JSON.stringify({ schema: 'fruitctl.config.v1', targets: {
+    pzm: { targetId: 'fixture-pzm', hostHelperFile: '/Users/controller/private/absent-binding.json' }
+  } }));
+  assert.deepEqual(await resolvePreflightTarget({ configPath: remoteProfile, target: 'pzm', bridge: 'neo' }),
+    { bridge: 'neo', remoteCommand: 'fruitctl', target: 'pzm' });
+  if (process.platform !== 'darwin') {
+    assert.deepEqual(await resolvePreflightTarget({ configPath: remoteProfile, target: 'pzm', environmentBridge: 'neo' }),
+      { bridge: 'neo', remoteCommand: 'fruitctl', target: 'pzm' });
+  }
   assert.deepEqual(await resolvePreflightTarget({ configPath: absent, target: 'pzm', environmentBridge: 'neo' }),
     { bridge: 'neo', remoteCommand: 'fruitctl', target: 'pzm' });
   assert.deepEqual(await resolvePreflightTarget({ configPath: absent, target: 'pzm', targetSsh: 'pzm', environmentBridge: 'neo' }),

@@ -21,6 +21,14 @@ test-host-installer node="node":
 test-broker node="node":
     {{quote(node)}} --test --test-concurrency=1 test/fruitctl-broker.test.js test/fruitctl-broker-review.test.js test/fruitctl-broker-observability.test.js test/fruitctl-deadline-budget.test.js test/fruitctl-relay.test.js
 
+# Offline freshness-probe and error-register fixtures; fake controller only.
+test-freshness-probe node="node":
+    {{quote(node)}} --test --test-concurrency=1 test/fruitctl-freshness-probe.test.js test/fruitctl-error-codes.test.js
+
+# Mock Host and Node protocol simulators only; no desktop or native daemon.
+test-host-permits node="node":
+    {{quote(node)}} --test --test-isolation=none --test-concurrency=1 test/fruitctl-host-helper.test.js test/fruitctl-native-permit.test.js
+
 # Offline full-raster fixture and streaming-oracle checks; contacts no desktop.
 test-qualification node="node":
     {{quote(node)}} --test --test-concurrency=1 test/qualification.test.js test/qualification-stream.test.js test/qualification-overlay-gate.test.js test/qualification-live-kit.test.js
