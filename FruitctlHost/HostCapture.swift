@@ -16,6 +16,67 @@ enum HostImageFormat: String, Sendable {
     var typeIdentifier: CFString { (self == .png ? UTType.png : UTType.jpeg).identifier as CFString }
 }
 
+/// Which windows a capture keeps (#163). `target` keeps only the named
+/// applications' windows (and their Save or Open panel service); everything
+/// else is black. `display` keeps the display minus this app and a fixed
+/// list of private applications. Geometry is the display's either way, so
+/// coordinates map exactly as before.
+struct HostCaptureScope: Equatable {
+    static let maximumApplications = 16
+    /// Always left out of a display capture: messages, mail and passwords.
+    static let privateApplications: Set<String> = ["com.apple.MobileSMS", "com.apple.mail", "com.apple.Passwords",
+        "com.apple.keychainaccess", "com.1password.1password", "com.agilebits.onepassword7",
+        "com.bitwarden.desktop", "com.lastpass.LastPass", "com.dashlane.dashlanephonefinal", "com.apple.iChat",
+        "net.whatsapp.WhatsApp", "ru.keepcoding.Telegram", "com.tinyspeck.slackmacgap"]
+    static let panelServices: Set<String> = ["com.apple.appkit.xpc.openAndSavePanelService"]
+
+    var include: [String]?
+    var exclude: [String] = []
+
+    static let display = HostCaptureScope(include: nil)
+
+    static func parse(_ params: [String: HostValue]) throws -> HostCaptureScope {
+        func list(_ name: String) throws -> [String]? {
+            guard let value = params[name] else { return nil }
+            guard case .array(let items) = value, !items.isEmpty, items.count <= maximumApplications else {
+                throw HostLeaseError.invalidParameters
+            }
+            let names = try items.map { item -> String in
+                guard let text = item.string, HostInputTarget.validBundle(text) else { throw HostLeaseError.invalidParameters }
+                return text
+            }
+            guard Set(names).count == names.count else { throw HostLeaseError.invalidParameters }
+            return names
+        }
+        let include = try list("include_bundle_ids")
+        let exclude = try list("exclude_bundle_ids") ?? []
+        guard include == nil || exclude.isEmpty else { throw HostLeaseError.invalidParameters }
+        return HostCaptureScope(include: include, exclude: exclude)
+    }
+
+    enum Plan: Equatable {
+        case including(processIDs: [pid_t])
+        case excluding(processIDs: [pid_t])
+    }
+
+    /// Pure choice of applications. Own app is never included; a target
+    /// scope with none of its applications running is refused.
+    func plan(running: [(processID: pid_t, bundleID: String?)], ownProcessID: pid_t) throws -> Plan {
+        let others = running.filter { $0.processID != ownProcessID }
+        if let include {
+            let targets = others.filter { $0.bundleID.map(include.contains) == true }
+            guard !targets.isEmpty else { throw HostCaptureError.targetUnavailable }
+            let panels = others.filter { $0.bundleID.map(Self.panelServices.contains) == true }
+            return .including(processIDs: (targets + panels).map(\.processID))
+        }
+        let hidden = Self.privateApplications.union(exclude)
+        return .excluding(processIDs: [ownProcessID] + others.filter { $0.bundleID.map(hidden.contains) == true }
+            .map(\.processID))
+    }
+
+    var filterName: String { include == nil ? "excluding_own_and_private_applications" : "including_target_applications" }
+}
+
 struct HostCapturedImage {
     let encoded: Data
     let format: HostImageFormat
@@ -28,6 +89,8 @@ struct HostCapturedImage {
     var bounds: CGRect { geometry.bounds }
     let excludedPID: pid_t
     let excludedBundleID: String
+    var scope = HostCaptureScope.display
+    var filteredApplications = 0
     let nativeFrameTiming: HostNativeFrameTiming
     /// Host-side milliseconds per stage, to place capture latency: window
     /// enumeration, ScreenCaptureKit, the owned copy, and scale plus encode;
@@ -47,7 +110,9 @@ struct HostCapturedImage {
          "point_width": .number(geometry.pointWidth), "point_height": .number(geometry.pointHeight),
          "scale": .number(geometry.scale),
          "cursor_included": .boolean(true),
-         "capture_filter": .string("excluding_entire_own_application"),
+         "capture_filter": .string(scope.filterName),
+         "capture_scope_bundle_ids": scope.include.map { .array($0.map { .string($0) }) } ?? .null,
+         "capture_filtered_applications": .integer(Int64(filteredApplications)),
          "native_capture_resolution": .string("best"),
          "native_pixel_format": .string("BGRA32"),
          "excluded_application_pid": .integer(Int64(excludedPID)),
@@ -176,7 +241,8 @@ final class HostCapture {
 
     func rebind(displayID: CGDirectDisplayID) { self.displayID = displayID }
 
-    func snapshot(maximumDimension: Int, format: HostImageFormat = .png) async throws -> HostCapturedImage {
+    func snapshot(maximumDimension: Int, format: HostImageFormat = .png,
+                  scope: HostCaptureScope = .display) async throws -> HostCapturedImage {
         guard maximumDimension > 0 else { throw HostCaptureError.incompleteImage }
         try permission.requireCapture(enabled: enabled)
         let displayID = self.displayID
@@ -212,8 +278,23 @@ final class HostCapture {
             throw HostCaptureError.incompleteImage
         }
         let width = geometry.pixelWidth, height = geometry.pixelHeight
-        let filter = SCContentFilter(display: display, excludingApplications: [ownApp],
-                                     exceptingWindows: [])
+        let plan = try scope.plan(running: content.applications.map { ($0.processID, $0.bundleIdentifier) },
+                                  ownProcessID: ownApp.processID)
+        let filter: SCContentFilter
+        let filtered: Int
+        switch plan {
+        case .including(let processIDs):
+            let apps = content.applications.filter { processIDs.contains($0.processID) }
+            filter = SCContentFilter(display: display, including: apps, exceptingWindows: [])
+            filtered = apps.count
+        case .excluding(let processIDs):
+            let apps = content.applications.filter { processIDs.contains($0.processID) }
+            guard apps.contains(where: { $0.processID == ownApp.processID }) else {
+                throw HostCaptureError.selfApplicationUnavailable
+            }
+            filter = SCContentFilter(display: display, excludingApplications: apps, exceptingWindows: [])
+            filtered = apps.count
+        }
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
@@ -261,6 +342,7 @@ final class HostCapture {
             scaledWidth: processed.scaledWidth, scaledHeight: processed.scaledHeight,
             displayID: displayID, geometry: geometry,
             excludedPID: ownApp.processID, excludedBundleID: ownApp.bundleIdentifier,
+            scope: scope, filteredApplications: filtered,
             nativeFrameTiming: captured.timing, stageMilliseconds: stages)
     }
 }

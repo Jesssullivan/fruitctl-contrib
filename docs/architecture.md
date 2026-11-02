@@ -460,6 +460,28 @@ cannot tell operator keys from the Host's own during typing, so `yield` refuses
 key and text input without the keyboard tap. Qualification of the tap, timing and
 Space behaviour on a live desktop is an attended gate.
 
+## Host capture scope
+
+Host captures leave out windows the agent should not see (#163). A Host-only
+target with `hostInput` captures only its input applications by default. Each
+image keeps the display's full geometry and every other window is black, so
+coordinates and AX frames map unchanged. The target's Save or Open panel
+service is kept with it. A display capture always leaves out FruitctlHost and a
+fixed private list: Messages, Mail, Passwords, Keychain Access, common password
+managers and chat apps. The profile can add more:
+
+```json
+"hostCapture": { "scope": "target", "applications": ["com.apple.logic10"] }
+"hostCapture": { "scope": "display", "exclude": ["com.cmuxterm.app"] }
+```
+
+A target scope fails closed with `capture_scope_unsupported` on a Host that
+does not report `capture_scope`. When no target application is running, the
+screenshot is a per-call `capture_target_unavailable` and the lease stays. The
+image metadata names the filter in `capture_filter` and the kept applications
+in `capture_scope_bundle_ids`. The begin-activity and idle-reference captures
+use the display scope.
+
 ## Error codes
 
 The native daemon, FruitctlHost, the Darwin broker, the Linux relay and the
@@ -501,6 +523,8 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `stale_ref` | Host route, Host | The element ref is not in the latest `ax_snapshot` |
 | `ax_unreachable` | Host | The element can no longer be reached |
 | `ax_action_unsupported` | Host | The element does not offer the action |
+| `capture_target_unavailable` | Host | A target-scoped capture found none of its applications running; nothing was captured |
+| `capture_scope_unsupported` | broker | The profile asks for target-only capture and this FruitctlHost cannot apply it |
 | `accessibility_root_unavailable` | Host | The `ax_snapshot` root (focused window or open menu) is absent; nothing was read |
 | `credential_unavailable` | broker | The VNC credential provider failed at startup |
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
