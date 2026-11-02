@@ -20,6 +20,12 @@ enum HostInputError: String, Error {
     case windowMismatch = "input_window_mismatch"
     /// Operator input arrived within the yield window.
     case operatorInput = "operator_input_detected"
+    /// `yield` with keyboard input needs an event tap that sees keys.
+    case monitorUnavailable = "operator_input_monitor_unavailable"
+    /// Typing needs a readable, focused text input owned by the target.
+    case focusUnavailable = "input_focus_unavailable"
+    /// The key combination is handled by the system, not the target.
+    case systemShortcut = "input_system_shortcut"
 }
 
 enum HostInputKind: String, CaseIterable {
@@ -227,8 +233,14 @@ struct HostInputRequest: Equatable {
         if kind == .type {
             guard let value = params["text"]?.string, !value.isEmpty,
                   value.count <= maximumTextCharacters, value.utf16.count <= maximumTextUTF16,
-                  // No control characters other than newline and tab.
-                  value.unicodeScalars.allSatisfy({ $0 == "\n" || $0 == "\t" || !($0.value < 0x20 || $0.value == 0x7F) })
+                  // No control characters other than newline and tab, no C1
+                  // controls and no bidirectional overrides.
+                  value.unicodeScalars.allSatisfy({ scalar in
+                      scalar == "\n" || scalar == "\t" || !(scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value)
+                          || (0x202A...0x202E).contains(scalar.value) || (0x2066...0x2069).contains(scalar.value)) }),
+                  // A newline or tab can move focus, so it ends the request;
+                  // the next request re-checks focus and secure input.
+                  !value.dropLast().contains(where: { $0 == "\n" || $0 == "\t" })
             else { throw invalid }
             text = value
         } else if params["text"] != nil { throw invalid }
@@ -284,6 +296,19 @@ enum HostInputStep: Equatable {
     case pause(milliseconds: UInt64)
 
     var posts: Int { if case .pause = self { return 0 }; if case .text = self { return 2 }; return 1 }
+
+    /// The event kinds one step posts, for per-kind attribution.
+    var kinds: [CGEventType] {
+        switch self {
+        case .pause: return []
+        case .move: return [.mouseMoved]
+        case .button(let button, let down, _, _, _): return [down ? button.downType : button.upType]
+        case .drag(let button, _, _): return [button.dragType]
+        case .scroll: return [.scrollWheel]
+        case .key(_, let down, let modifier, _): return modifier ? [.flagsChanged] : [down ? .keyDown : .keyUp]
+        case .text: return [.keyDown, .keyUp]
+        }
+    }
 }
 
 /// Pure planner: request plus geometry to an exact step list.
@@ -420,8 +445,13 @@ struct HostInputEnvironment: Equatable {
     var focusOwner: HostInputProcess?
     var focusSecure: Bool = false
     var focusedWindowTitle: String?
+    /// The focused element is a text input (field, area, combo or search).
+    var focusIsText = false
+    /// The frontmost application's Apple menu title in the menu bar.
+    var appleMenuFrame: CGRect?
     /// Milliseconds since the latest input event this Host did not post.
     var operatorInputAge: UInt64?
+    var monitorMode = "event_tap"
 }
 
 enum HostInputGate {
@@ -434,18 +464,43 @@ enum HostInputGate {
 
     /// `start` decides before the first event; later steps re-check only
     /// what can change mid-action without the pointer moving to a new owner.
+    /// Key combinations macOS or the Dock handle before the target does:
+    /// app and Space switching, Spotlight, input sources, force quit, lock,
+    /// log out and the menu-bar keyboard focus.
+    static let systemShortcuts: [[String]] = [["cmd", "tab"], ["cmd", "space"], ["ctrl", "space"],
+        ["cmd", "alt", "escape"], ["ctrl", "cmd", "q"], ["cmd", "shift", "q"], ["cmd", "alt", "shift", "q"],
+        ["ctrl", "f2"], ["ctrl", "f3"], ["ctrl", "up"], ["ctrl", "down"], ["ctrl", "left"], ["ctrl", "right"],
+        ["cmd", "alt", "d"], ["cmd", "`"], ["ctrl", "cmd", "space"], ["cmd", "shift", "/"]]
+
+    static func isSystemShortcut(_ keys: [String]) -> Bool {
+        let flags = keys.dropLast().compactMap { HostKeyMap.modifier($0)?.flag }
+        let canonical = Set(flags.map { flag -> String in
+            flag == .maskCommand ? "cmd" : flag == .maskShift ? "shift" : flag == .maskControl ? "ctrl" : "alt" })
+        guard let last = keys.last, let key = HostKeyMap.key(last) else { return false }
+        return systemShortcuts.contains { shortcut in
+            Set(shortcut.dropLast()) == canonical && HostKeyMap.key(shortcut.last!)?.code == key.code
+        }
+    }
+
+    static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+    /// Activation takes the keyboard from the operator whatever the policy.
+    static let activationIdleMilliseconds: UInt64 = 2_000
+
     static func check(_ request: HostInputRequest, _ environment: HostInputEnvironment, start: Bool,
-                      pointerCheck: Bool) throws {
+                      pointerCheck: Bool, point: CGPoint? = nil) throws {
         if environment.secureInput { throw HostInputError.secureInput }
+        if request.kind == .key, isSystemShortcut(request.keys) { throw HostInputError.systemShortcut }
         let owners = [environment.frontmost, pointerCheck ? environment.windowOwner : nil,
                       request.kind.pointer ? nil : environment.focusOwner].compactMap { $0?.executable }
         if owners.contains(where: HostAXActionPlanner.consentDialogOwners.contains) {
             throw HostAXActionError.consentDialog
         }
         if request.kind == .activate {
-            // Activation changes focus; it still yields to the operator.
-            if request.policy == .yield, let age = environment.operatorInputAge,
-               age < request.operatorIdleMilliseconds { throw HostInputError.operatorInput }
+            // Activation moves the operator's keyboard; it always yields.
+            if let age = environment.operatorInputAge,
+               age < max(request.operatorIdleMilliseconds, activationIdleMilliseconds) {
+                throw HostInputError.operatorInput
+            }
             return
         }
         guard let frontmost = environment.frontmost, frontmost.bundleID == request.target.bundleID,
@@ -454,25 +509,39 @@ enum HostInputGate {
         }
         if pointerCheck {
             guard let owner = environment.windowOwner else { throw HostInputError.windowMismatch }
+            let menuBar = environment.windowOwnerName == windowServer && environment.windowLayer == menuBarLayer
             let acting = owner.processID == frontmost.processID
-                || owner.bundleID.map(panelServices.contains) == true
-                || (environment.windowOwnerName == windowServer && environment.windowLayer == menuBarLayer)
+                || owner.bundleID.map(panelServices.contains) == true || menuBar
             guard acting else { throw HostInputError.windowMismatch }
+            // The Apple menu holds Sleep, Lock Screen and Log Out.
+            if menuBar, let point, environment.appleMenuFrame?.contains(point) == true {
+                throw HostInputError.windowMismatch
+            }
         }
         if start, !request.kind.pointer {
             if environment.focusSecure { throw HostInputError.secureInput }
-            // An unreadable focus is allowed; a readable one must act for the target.
             if let owner = environment.focusOwner, owner.processID != frontmost.processID,
                owner.bundleID.map(panelServices.contains) != true {
                 throw HostInputError.targetMismatch
+            }
+            // Typing needs a readable text input; an unreadable or non-text
+            // focus would turn characters into the target's key commands.
+            if request.kind == .type, environment.focusOwner == nil || !environment.focusIsText {
+                throw HostInputError.focusUnavailable
             }
         }
         if start, let title = request.target.windowTitle, environment.focusedWindowTitle != title {
             throw HostInputError.targetMismatch
         }
-        if start, request.policy == .yield, let age = environment.operatorInputAge,
-           age < request.operatorIdleMilliseconds {
-            throw HostInputError.operatorInput
+        if start, request.policy == .yield {
+            // Without a tap that sees keys, operator typing during a key or
+            // type action cannot be told from the Host's own (review B2).
+            if !request.kind.pointer, environment.monitorMode != "event_tap" {
+                throw HostInputError.monitorUnavailable
+            }
+            if let age = environment.operatorInputAge, age < request.operatorIdleMilliseconds {
+                throw HostInputError.operatorInput
+            }
         }
     }
 }
@@ -527,29 +596,51 @@ final class HostInputSession {
         self.now = now; self.sleep = sleep
     }
 
+    /// Buttons and keys this session pressed and has not released. Stop,
+    /// Quit and signals release them synchronously through `releaseHeld`.
+    private var heldButtons: [HostMouseButton: CGPoint] = [:]
+    private var heldKeys: [(code: CGKeyCode, modifier: Bool)] = []
+
+    /// Releases every held button and key at the current pointer location,
+    /// never moving the pointer. Returns how many events it posted.
+    @discardableResult
+    func releaseHeld() -> Int {
+        var released = 0
+        let here = CGEvent(source: nil)?.location
+        for (button, point) in heldButtons {
+            if poster.post(.button(button, down: false, at: here ?? point, clicks: 1, flags: [])) { released += 1 }
+        }
+        for key in heldKeys.reversed() {
+            if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
+        }
+        heldButtons.removeAll(); heldKeys.removeAll()
+        if released > 0 { monitor.notePosted(at: now()) }
+        return released
+    }
+
     func run(_ request: HostInputRequest, steps: [HostInputStep], lease: Check) async throws -> Outcome {
         let firstPoint = steps.lazy.compactMap { step -> CGPoint? in
             if case .move(let point) = step { return point }; return nil
         }.first
+        // A drag's drop point must belong to the target too (review H4).
+        let dropPoint = request.kind == .drag ? steps.lazy.compactMap { step -> CGPoint? in
+            if case .button(_, false, let at, _, _) = step { return at }; return nil
+        }.last : nil
         // Refusals before the first event keep the lease (typed errors).
         try lease()
-        try HostInputGate.check(request, environment(firstPoint, true), start: true, pointerCheck: firstPoint != nil)
+        try HostInputGate.check(request, environment(firstPoint, true), start: true, pointerCheck: firstPoint != nil,
+                                point: firstPoint)
+        if let dropPoint {
+            try HostInputGate.check(request, environment(dropPoint, false), start: false, pointerCheck: true,
+                                    point: dropPoint)
+        }
         let started = now()
         var sampledAt: UInt64?
         var outcome = Outcome()
-        var heldButtons: [HostMouseButton: CGPoint] = [:]
-        var heldKeys: [(code: CGKeyCode, modifier: Bool)] = []
+        heldButtons.removeAll(); heldKeys.removeAll()
         func stop(_ reason: String) {
             outcome.stopReason = reason
-            // Release in reverse: buttons first at their last point, then keys.
-            for (button, point) in heldButtons {
-                if poster.post(.button(button, down: false, at: point, clicks: 1, flags: [])) { outcome.released += 1 }
-            }
-            for key in heldKeys.reversed() {
-                if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { outcome.released += 1 }
-            }
-            heldButtons.removeAll(); heldKeys.removeAll()
-            monitor.notePosted(at: now())
+            outcome.released += releaseHeld()
         }
         for (index, step) in steps.enumerated() {
             if case .pause(let milliseconds) = step { await sleep(milliseconds); continue }
@@ -560,8 +651,10 @@ final class HostInputSession {
                     // later points may cross windows by design.
                     var pointer: CGPoint?
                     if case .button(_, true, let at, _, _) = step, heldButtons.isEmpty { pointer = at }
+                    // A drop is re-checked where it lands before the button-up.
+                    if case .button(_, false, let at, _, _) = step, request.kind == .drag { pointer = at }
                     try HostInputGate.check(request, environment(pointer, false), start: false,
-                                            pointerCheck: pointer != nil)
+                                            pointerCheck: pointer != nil, point: pointer)
                 }
             } catch let error as HostInputError {
                 stop(error.rawValue); return outcome
@@ -581,7 +674,7 @@ final class HostInputSession {
             }
             guard poster.post(step) else { stop("post_failed"); return outcome }
             outcome.posted += step.posts
-            monitor.notePosted(at: now())
+            monitor.notePosted(step.kinds, at: now())
             switch step {
             case .button(let button, true, let at, _, _): heldButtons[button] = at
             case .button(let button, false, _, _, _): heldButtons[button] = nil
@@ -603,6 +696,8 @@ protocol HostInputPoster {
 
 protocol HostOperatorInputMonitoring: AnyObject {
     @MainActor func notePosted(at milliseconds: UInt64)
+    /// Records the Host's own post of these event kinds only.
+    @MainActor func notePosted(_ kinds: [CGEventType], at milliseconds: UInt64)
     /// Operator input events observed since the given Host time.
     @MainActor func foreignInputCount(since milliseconds: UInt64) -> Int
     /// Milliseconds since the latest operator input, or nil when none is known.
@@ -642,15 +737,19 @@ final class HostSystemInputPoster: HostInputPoster {
             if modifier { event?.type = .flagsChanged }
             event?.flags = flags
         case .text(let text):
+            // Both events exist before either is posted, so a failure never
+            // leaves a key down.
             let units = Array(text.utf16)
-            for down in [true, false] {
-                guard let key = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { return false }
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return false }
+            for key in [down, up] {
                 key.flags = []
                 units.withUnsafeBufferPointer { key.keyboardSetUnicodeString(stringLength: units.count,
                                                                              unicodeString: $0.baseAddress) }
                 key.setIntegerValueField(.eventSourceUserData, value: Self.tag)
-                key.post(tap: .cghidEventTap)
             }
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
             return true
         }
         guard let event else { return false }
@@ -672,10 +771,19 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
     private let clock: () -> UInt64
     private let lock = NSLock()
     private var foreign: [UInt64] = []
-    private var ownPostAt: UInt64?
+    /// The Host's latest post of each event kind (review B2): an operator
+    /// key press during a click, or a move during typing, is still foreign.
+    private var ownPostAt: [UInt32: UInt64] = [:]
+    private var tapMode = "event_times"
     private var tap: CFMachPort?
     private var tapThread: Thread?
-    private(set) var mode = "event_times"
+    /// Re-reads the tap: one macOS disabled and could not re-enable no
+    /// longer counts, and the time attribution covers every kind again.
+    var mode: String {
+        guard let tap else { return "event_times" }
+        if !CGEvent.tapIsEnabled(tap: tap) { CGEvent.tapEnable(tap: tap, enable: true) }
+        return CGEvent.tapIsEnabled(tap: tap) ? tapMode : "event_times"
+    }
 
     init(clock: @escaping () -> UInt64) { self.clock = clock }
 
@@ -699,7 +807,7 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
             }, userInfo: refcon) else { return }
         tap = port
         // Keyboard events reach a listen-only tap only with Input Monitoring.
-        mode = CGPreflightListenEventAccess() ? "event_tap" : "event_tap_pointer"
+        tapMode = CGPreflightListenEventAccess() ? "event_tap" : "event_tap_pointer"
         let thread = Thread {
             guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else { return }
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
@@ -720,7 +828,11 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
     }
 
     @MainActor func notePosted(at milliseconds: UInt64) {
-        lock.lock(); ownPostAt = milliseconds; lock.unlock()
+        lock.lock(); for kind in Self.kinds { ownPostAt[kind.rawValue] = milliseconds }; lock.unlock()
+    }
+
+    @MainActor func notePosted(_ kinds: [CGEventType], at milliseconds: UInt64) {
+        lock.lock(); for kind in kinds { ownPostAt[kind.rawValue] = milliseconds }; lock.unlock()
     }
 
     /// Time-based attribution for the kinds a tap does not cover.
@@ -729,6 +841,7 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
         let kinds: [CGEventType] = mode == "event_tap" ? [] : mode == "event_tap_pointer" ? keyboard : Self.kinds
         lock.lock(); let own = ownPostAt; lock.unlock()
         var latest: UInt64?
+        let mode = self.mode
         for kind in kinds {
             // The combined session table covers device input and every
             // posting process, remote-control clients included.
@@ -736,7 +849,8 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
             guard seconds.isFinite, seconds >= 0, seconds < 86_400 else { continue }
             let elapsed = UInt64(seconds * 1_000)
             guard elapsed <= now else { continue }
-            if let at = HostOperatorInputAttribution.foreignEventAt(lastEventAt: now - elapsed, ownPostAt: own) {
+            if let at = HostOperatorInputAttribution.foreignEventAt(lastEventAt: now - elapsed,
+                                                                     ownPostAt: own[kind.rawValue]) {
                 latest = max(latest ?? 0, at)
             }
         }
@@ -764,7 +878,7 @@ final class HostOperatorInputMonitor: HostOperatorInputMonitoring, @unchecked Se
 enum HostSystemInputEnvironment {
     static func read(point: CGPoint?, start: Bool, keyboard: Bool, wantsTitle: Bool,
                      executable: (pid_t) -> String?, monitor: HostOperatorInputMonitoring,
-                     now: UInt64) -> HostInputEnvironment {
+                     now: UInt64, ownPanels: Set<Int>) -> HostInputEnvironment {
         func process(_ pid: pid_t) -> HostInputProcess {
             HostInputProcess(processID: pid, bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
                              executable: executable(pid))
@@ -778,7 +892,10 @@ enum HostSystemInputEnvironment {
                                                                  kCGNullWindowID) as? [[String: Any]] {
             for window in windows {
                 guard let pid = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                      pid != getpid(),
+                      // Only the click-through indicator panels are looked
+                      // through; the status item and its menu are refused.
+                      !(pid == getpid() && ownPanels.contains((window[kCGWindowNumber as String] as? NSNumber)?
+                          .intValue ?? -1)),
                       let boundsInfo = window[kCGWindowBounds as String] as? NSDictionary,
                       let bounds = CGRect(dictionaryRepresentation: boundsInfo as CFDictionary),
                       bounds.contains(point),
@@ -787,6 +904,11 @@ enum HostSystemInputEnvironment {
                 environment.windowOwnerName = window[kCGWindowOwnerName as String] as? String
                 environment.windowLayer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
                 break
+            }
+            if environment.windowOwnerName == HostInputGate.windowServer, let front = environment.frontmost,
+               let bar = element(AXUIElementCreateApplication(front.processID), kAXMenuBarAttribute),
+               let apple = children(bar).first {
+                environment.appleMenuFrame = frame(apple)
             }
         }
         if start, keyboard {
@@ -802,6 +924,8 @@ enum HostSystemInputEnvironment {
                 _ = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
                 environment.focusSecure = (role as? String) == "AXSecureTextField"
                     || (subrole as? String) == "AXSecureTextField"
+                environment.focusIsText = (role as? String).map(HostInputGate.textRoles.contains) == true
+                    || (subrole as? String) == "AXSearchField"
             }
         }
         if start, wantsTitle, let front = environment.frontmost {
@@ -816,8 +940,37 @@ enum HostSystemInputEnvironment {
                 }
             }
         }
-        if start { environment.operatorInputAge = monitor.operatorInputAge(now: now) }
+        if start {
+            environment.operatorInputAge = monitor.operatorInputAge(now: now)
+            environment.monitorMode = monitor.mode
+        }
         return environment
+    }
+
+    private static func element(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func children(_ element: AXUIElement) -> [AXUIElement] {
+        var values: CFArray?
+        guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, 4, &values) == .success,
+              let items = values as? [AnyObject] else { return [] }
+        return items.compactMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
+    }
+
+    private static func frame(_ element: AXUIElement) -> CGRect? {
+        var position: AnyObject?, size: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size) == .success,
+              let position, let size, CFGetTypeID(position) == AXValueGetTypeID(),
+              CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+        var origin = CGPoint.zero, extent = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(size as! AXValue, .cgSize, &extent) else { return nil }
+        return CGRect(origin: origin, size: extent)
     }
 }
 

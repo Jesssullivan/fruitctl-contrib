@@ -25,8 +25,8 @@ The Host source supplies images, an Accessibility snapshot, element actions and
 an indicator. Its input service posts synthetic events only for a Host-only
 target with `hostInput`, after the local **Enable agent input** choice. The same
 Accessibility grant allows posting. Input Monitoring is optional: with it, the
-operator-input tap also sees keyboard events. Without that service the Host
-posts no synthetic events. The
+operator-input tap also sees keyboard events, which `yield` needs for key and
+text input. With the input service off, the Host posts no synthetic events. The
 Accessibility grant serves two purposes: reading the tree for `ax_snapshot`, and
 `click_element` / `focus_element`, which ask one element from the latest snapshot
 to perform `AXPress` or set `AXFocused`. Those element actions run only under the

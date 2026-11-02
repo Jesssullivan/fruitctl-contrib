@@ -22,6 +22,8 @@ final class HostInputTests: XCTestCase {
         value.frontmost = HostInputProcess(processID: front, bundleID: bundle, executable: "Logic Pro X")
         value.windowOwner = window
         value.windowLayer = 0
+        value.focusOwner = HostInputProcess(processID: front, bundleID: bundle, executable: "Logic Pro X")
+        value.focusIsText = true
         return value
     }
 
@@ -124,13 +126,18 @@ final class HostInputTests: XCTestCase {
     }
 
     func testTypingSendsUnicodeTextAndKeysForNewlineAndTab() throws {
-        let steps = try HostInputPlanner.plan(request(["kind": .string("type"), "text": .string("é\n🎸\t")]),
+        let steps = try HostInputPlanner.plan(request(["kind": .string("type"), "text": .string("é🎸\t")]),
                                               geometry: geometry).filter { $0.posts > 0 }
-        XCTAssertEqual(steps, [.text("é"),
-            .key(CGKeyCode(kVK_Return), down: true, modifier: false, flags: []),
-            .key(CGKeyCode(kVK_Return), down: false, modifier: false, flags: []), .text("🎸"),
+        XCTAssertEqual(steps, [.text("é"), .text("🎸"),
             .key(CGKeyCode(kVK_Tab), down: true, modifier: false, flags: []),
             .key(CGKeyCode(kVK_Tab), down: false, modifier: false, flags: [])])
+        let line = try HostInputPlanner.plan(request(["kind": .string("type"), "text": .string("ok\n")]),
+                                             geometry: geometry).filter { $0.posts > 0 }
+        XCTAssertEqual(line.last, .key(CGKeyCode(kVK_Return), down: false, modifier: false, flags: []))
+        // A newline or tab can move focus, so only the last character may be one.
+        for text in ["a\nb", "user\tsecret", "x\u{202E}y", "x\u{85}y"] {
+            XCTAssertThrowsError(try request(["kind": .string("type"), "text": .string(text)]), text)
+        }
     }
 
     func testGateRefusesSecureInputMismatchedTargetsAndConsentOwners() throws {
@@ -169,6 +176,11 @@ final class HostInputTests: XCTestCase {
     func testKeyboardGateChecksFocusTitleAndOperatorInput() throws {
         let typing = try request(["kind": .string("type"), "text": .string("Mobile")])
         var value = environment(window: nil)
+        value.focusIsText = false
+        XCTAssertThrowsError(try HostInputGate.check(typing, value, start: true, pointerCheck: false)) {
+            XCTAssertEqual($0 as? HostInputError, .focusUnavailable)
+        }
+        value.focusIsText = true
         XCTAssertNoThrow(try HostInputGate.check(typing, value, start: true, pointerCheck: false))
         value.focusSecure = true
         XCTAssertThrowsError(try HostInputGate.check(typing, value, start: true, pointerCheck: false))
@@ -178,6 +190,11 @@ final class HostInputTests: XCTestCase {
         value.focusOwner = HostInputProcess(processID: 54346,
             bundleID: "com.apple.appkit.xpc.openAndSavePanelService", executable: nil)
         XCTAssertNoThrow(try HostInputGate.check(typing, value, start: true, pointerCheck: false))
+        value.monitorMode = "event_tap_pointer"
+        XCTAssertThrowsError(try HostInputGate.check(typing, value, start: true, pointerCheck: false)) {
+            XCTAssertEqual($0 as? HostInputError, .monitorUnavailable)
+        }
+        value.monitorMode = "event_tap"
         let titled = try request(["kind": .string("key"), "keys": .array([.string("cmd"), .string("s")]),
             "target": .object(["bundle_id": .string("com.apple.logic10"), "window_title": .string("Song - Tracks")])])
         value.focusedWindowTitle = "Other - Tracks"
@@ -190,11 +207,36 @@ final class HostInputTests: XCTestCase {
         }
         let asserting = try request(["kind": .string("type"), "text": .string("x"), "operator_input": .string("assert")])
         XCTAssertNoThrow(try HostInputGate.check(asserting, value, start: true, pointerCheck: false))
-        let activate = try request(["kind": .string("activate")])
+        let activate = try request(["kind": .string("activate"), "operator_input": .string("assert")])
+        // Activation yields to recent operator input even under assert.
+        XCTAssertThrowsError(try HostInputGate.check(activate, value, start: true, pointerCheck: false))
+        value.operatorInputAge = 1_500
         XCTAssertThrowsError(try HostInputGate.check(activate, value, start: true, pointerCheck: false))
         value.operatorInputAge = 5_000
         value.frontmost = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
         XCTAssertNoThrow(try HostInputGate.check(activate, value, start: true, pointerCheck: false))
+    }
+
+    func testSystemShortcutsAndTheAppleMenuAreRefused() throws {
+        for keys in [["cmd", "tab"], ["command", "space"], ["ctrl", "cmd", "q"], ["cmd", "option", "escape"],
+                     ["rcmd", "shift", "q"], ["ctrl", "f2"], ["ctrl", "right"]] {
+            let combo = try request(["kind": .string("key"), "keys": .array(keys.map { .string($0) })])
+            XCTAssertThrowsError(try HostInputGate.check(combo, environment(window: nil), start: true,
+                                                         pointerCheck: false), "\(keys)") {
+                XCTAssertEqual($0 as? HostInputError, .systemShortcut)
+            }
+        }
+        let save = try request(["kind": .string("key"), "keys": .array([.string("cmd"), .string("s")])])
+        XCTAssertNoThrow(try HostInputGate.check(save, environment(window: nil), start: true, pointerCheck: false))
+        let click = try request(["kind": .string("click"), "x": .integer(1), "y": .integer(1)])
+        var menu = environment(window: HostInputProcess(processID: 300, bundleID: nil, executable: nil))
+        menu.windowOwnerName = "Window Server"
+        menu.windowLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+        menu.appleMenuFrame = CGRect(x: 100, y: 0, width: 30, height: 24)
+        XCTAssertThrowsError(try HostInputGate.check(click, menu, start: true, pointerCheck: true,
+                                                     point: CGPoint(x: 110, y: 10)))
+        XCTAssertNoThrow(try HostInputGate.check(click, menu, start: true, pointerCheck: true,
+                                                 point: CGPoint(x: 160, y: 10)))
     }
 
     func testTimeAttributionSeparatesOwnPostsFromOperatorEvents() {
@@ -216,6 +258,7 @@ final class HostInputTests: XCTestCase {
         var foreign = 0
         var mode: String { "test" }
         func notePosted(at milliseconds: UInt64) {}
+        func notePosted(_ kinds: [CGEventType], at milliseconds: UInt64) {}
         func foreignInputCount(since milliseconds: UInt64) -> Int { foreign }
         func operatorInputAge(now: UInt64) -> UInt64? { nil }
     }
@@ -309,6 +352,36 @@ final class HostInputTests: XCTestCase {
                 XCTAssertEqual(outcome.posted, 12)
             }
         }
+    }
+
+    func testDragOntoAnotherAppIsRefusedBeforeThePress() async throws {
+        let poster = Poster()
+        let input = try request(["kind": .string("drag"), "x": .integer(0), "y": .integer(0),
+                                 "to_x": .integer(400), "to_y": .integer(0)])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        let finder = HostInputProcess(processID: 400, bundleID: "com.apple.finder", executable: "Finder")
+        do {
+            _ = try await runner(poster, Monitor(), environment: { point, _ in
+                (point?.x ?? 0) > 200 ? self.environment(window: finder) : self.environment()
+            }).run(input, steps: steps, lease: {})
+            XCTFail("expected a refusal")
+        } catch { XCTAssertEqual(error as? HostInputError, .windowMismatch) }
+        XCTAssertTrue(poster.posted.isEmpty)
+    }
+
+    func testReleaseHeldFreesButtonsAndKeysWithoutMoving() async throws {
+        let poster = Poster()
+        let input = try request(["kind": .string("key"), "keys": .array([.string("cmd"), .string("s")])])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        var session: HostInputSession?
+        var pauses = 0
+        session = runner(poster, Monitor(), environment: { _, _ in self.environment(window: nil) }, onSleep: {
+            pauses += 1
+            // Stop arrives while Command is held: release it at once.
+            if pauses == 1 { XCTAssertEqual(session?.releaseHeld(), 1) }
+        })
+        _ = try await session!.run(input, steps: steps, lease: {})
+        XCTAssertTrue(poster.posted.contains(.key(CGKeyCode(kVK_Command), down: false, modifier: true, flags: [])))
     }
 
     func testTargetChangeMidClickStopsBeforeThePress() async throws {

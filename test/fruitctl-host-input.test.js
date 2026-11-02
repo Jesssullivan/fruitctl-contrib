@@ -97,9 +97,39 @@ test('key_type text is chunked without splitting characters and CR becomes newli
     const text = '🎸'.repeat(40) + 'a\r\nb';
     const [typed] = await executor.execute([{ action: 'key_type', text }]);
     const chunks = inputs(host).map(params => params.text);
-    assert.deepEqual(chunks, ['🎸'.repeat(32), '🎸'.repeat(8) + 'a\nb']);
-    assert.equal(typed.result.host_input.posted_events, 6);
-    assert.equal(host.requests.filter(request => request.action === 'capture').length, 1);
+    // A newline ends its request; the Host re-checks focus before 'b'.
+    assert.deepEqual(chunks, ['🎸'.repeat(32), '🎸'.repeat(8) + 'a\n', 'b']);
+    assert.equal(typed.result.host_input.posted_events, 9);
+    // A ZWJ sequence is one grapheme and is never split across requests.
+    const family = '👩‍👩‍👧';
+    await executor.execute([{ action: 'key_type', text: 'x'.repeat(31) + family + 'y' }]);
+    assert.deepEqual(inputs(host).slice(3).map(params => params.text), ['x'.repeat(31) + family, 'y']);
+    assert.equal(host.requests.filter(request => request.action === 'capture').length, 2);
+  } finally { await executor.close(); }
+});
+
+test('a lease that ends mid-action retires the lane with the posted count', async () => {
+  const hosts = inputHost();
+  hosts.attachments.length = 0;
+  const executor = await nativeFactory(hostOnlyProfile({ hostInput: policy() }), { hostSpawn(command, args) {
+    const child = hosts.spawnImpl(command, args);
+    const host = hosts.attachments.at(-1);
+    const write = child.stdout.write.bind(child.stdout);
+    child.stdout.write = line => {
+      const reply = JSON.parse(line);
+      if (host.requests.find(request => request.id === reply.id)?.action === 'input') {
+        return write(JSON.stringify({ id: reply.id, success: true, result: { instance_id: 'resident-test-app',
+          session_id: reply.result.session_id, lease_lost: true,
+          input: { kind: 'drag', posted_events: 5, completed: false, stop_reason: 'lease_lost' } } }) + '\n');
+      }
+      return write(line);
+    };
+    return child;
+  } });
+  try {
+    await assert.rejects(executor.execute([{ action: 'mouse_drag', x: 0, y: 0, toX: 9, toY: 9 }]),
+      /lease ended after 5 events/);
+    assert.ok(executor.failed);
   } finally { await executor.close(); }
 });
 

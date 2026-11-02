@@ -83,6 +83,10 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private var axSnapshotInProgress = false
     private var axActionInProgress = false
     private var inputInProgress = false
+    /// The running input action, so Stop and Quit release what it holds.
+    private var activeInputSession: HostInputSession?
+    /// The local Fruitctl menu is open: the operator is reaching for Stop.
+    private var humanMenuOpen = false
     private let inputPreferences: HostInputPreferences
     private let inputPoster = HostSystemInputPoster()
     private lazy var inputMonitor = HostOperatorInputMonitor(clock: { [clock] in clock.milliseconds() })
@@ -191,6 +195,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        activeInputSession?.releaseHeld()
         invalidateActivity(reason: .hostStopping)
         server?.stop(); server = nil
         for observer in notifications {
@@ -275,7 +280,12 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         statusItem?.button?.setAccessibilityLabel(description)
     }
 
-    func menuWillOpen(_ menu: NSMenu) { updateHumanControl() }
+    func menuWillOpen(_ menu: NSMenu) {
+        humanMenuOpen = true
+        updateHumanControl()
+    }
+
+    func menuDidClose(_ menu: NSMenu) { humanMenuOpen = false }
 
     @objc private func stopAgentControl(_ sender: Any?) {
         // Raw, nonthrowing entry observation only. Diagnostic validation and
@@ -286,6 +296,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         lease.stopFromHuman(instanceID: instanceID, processID: getpid(), displayID: capture.displayID,
                             displayGeneration: generation, now: invokedAt)
         let eventID = lease.lastHumanStopEvent?.eventID
+        // Release any button or key an input action holds, synchronously.
+        activeInputSession?.releaseHeld()
         invalidateActivity(reason: .humanStopped)
         updateHumanControl()
         let completionHostTime = HostCoreMediaClock.sample()
@@ -584,7 +596,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                                  "ax_snapshot", "ax_action", "input"].map { .string($0) })
                 // #157: input posts CGEvents only under the local opt-in,
                 // the Accessibility grant and a live, indicated lease.
-                status["input_service"] = .boolean(inputPreferences.isEnabled)
+                status["input_service"] = .boolean(inputPreferences.isEnabled && HostSystemInputPoster.permitted)
                 status["input_enabled"] = .boolean(inputPreferences.isEnabled)
                 status["input_post_permission"] = .boolean(HostSystemInputPoster.permitted)
                 status["operator_input_monitor"] = .string(inputMonitor.mode)
@@ -949,12 +961,16 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             _ = try self.requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
                                         geometry: geometry)
             guard self.inputPreferences.isEnabled else { throw HostInputError.disabled }
+            // A controller that gave up (EOF, timeout) gets no further events.
+            guard self.server?.connectionIsLive(connectionID) == true else { throw HostLeaseError.expired }
+            // The operator opened the Fruitctl menu, most likely for Stop.
+            guard !self.humanMenuOpen else { throw HostInputError.operatorInput }
         }
         let read: @MainActor (CGPoint?, Bool) -> HostInputEnvironment = { [unowned self] point, start in
             HostSystemInputEnvironment.read(point: point, start: start, keyboard: !input.kind.pointer,
                 wantsTitle: input.target.windowTitle != nil,
                 executable: { self.accessibility.executableName(processID: $0) },
-                monitor: self.inputMonitor, now: self.clock.milliseconds())
+                monitor: self.inputMonitor, now: self.clock.milliseconds(), ownPanels: self.renderer.panelWindowNumbers)
         }
         let pause: (UInt64) async -> Void = { milliseconds in
             try? await Task.sleep(nanoseconds: milliseconds * 1_000_000)
@@ -964,13 +980,25 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             if input.kind == .activate {
                 outcome = try await activate(input, lease: leaseCheck, read: read, pause: pause)
             } else {
-                outcome = try await HostInputSession(poster: inputPoster, environment: read, monitor: inputMonitor,
-                    now: { [clock] in clock.milliseconds() }, sleep: pause).run(input, steps: steps, lease: leaseCheck)
+                let runner = HostInputSession(poster: inputPoster, environment: read, monitor: inputMonitor,
+                    now: { [clock] in clock.milliseconds() }, sleep: pause)
+                activeInputSession = runner
+                defer { activeInputSession = nil }
+                outcome = try await runner.run(input, steps: steps, lease: leaseCheck)
             }
-            let current = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
-                                              geometry: geometry)
             let frontmost = NSWorkspace.shared.frontmostApplication.map {
                 HostInputProcess(processID: $0.processIdentifier, bundleID: $0.bundleIdentifier, executable: nil)
+            }
+            let current: HostActivityLease
+            do {
+                current = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                             geometry: geometry)
+            } catch {
+                // The lease ended mid-action (Stop, expiry, display change).
+                // Report what was posted; the controller retires its lane.
+                if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+                return ["instance_id": .string(instanceID), "session_id": .string(session), "lease_lost": .boolean(true),
+                        "input": .object(outcome.metadata(input, frontmost: frontmost, monitor: inputMonitor.mode))]
             }
             return readiness(now: clock.milliseconds(), activity: current).merging(["input": .object(
                 outcome.metadata(input, frontmost: frontmost, monitor: inputMonitor.mode))]) { _, value in value }

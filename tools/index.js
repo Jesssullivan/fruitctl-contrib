@@ -101,6 +101,9 @@ export function validateActionParameters(input) {
   if (input.format !== undefined && input.action !== 'screenshot') {
     throw new Error(`format applies only to screenshot, not ${input.action}`);
   }
+  if (input.window !== undefined && !HOST_APP_ACTIONS.has(input.action)) {
+    throw new Error(`window applies only to Host route input, not ${input.action}`);
+  }
   if (input.app !== undefined && !HOST_APP_ACTIONS.has(input.action)) {
     throw new Error(`app applies only to Host route input, not ${input.action}`);
   }
@@ -211,6 +214,8 @@ export function vncCommandTool() {
       text: z.string().optional().describe('Text to type or paste'),
       ref: commandRef(),
       app: appBundle(),
+      window: z.string().min(1).max(256).optional()
+        .describe('Host route input: the focused window title the action requires'),
       direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
       amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
       ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),
@@ -288,6 +293,7 @@ export function actionQueueTool() {
     text: z.string().optional().describe('Text to type or paste'),
     ref: secretRef(),
     app: appBundle(),
+    window: z.string().min(1).max(256).optional().describe('Host route input: required focused window title'),
     direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
     amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
     ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),
