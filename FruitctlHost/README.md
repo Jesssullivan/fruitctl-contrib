@@ -3,8 +3,17 @@
 This optional macOS 15+ Apple silicon app renders the purple human indicator
 and captures its configured display through ScreenCaptureKit. The existing
 LibVNC client and input writer remain on the controlling Darwin seat; the
-target continues to serve Apple Screen Sharing. This app has no input service.
-With the Accessibility grant it also returns a read-only Accessibility snapshot.
+target continues to serve Apple Screen Sharing. With the Accessibility grant it
+also returns an Accessibility snapshot and performs element actions.
+
+Its input service is off by default (#157). The operator turns it on locally
+with **Enable agent input** or an attended `--enable-input` launch; IPC cannot.
+Then, for a Host-only target, the app posts pointer and keyboard CGEvents for
+the one controller holding a live, indicated lease. Before every event it
+re-checks that lease, the Stop latch, secure event input and the frontmost
+target. A press also checks the window under the pointer. It never types into
+a secure field. See the `input` row below and
+[the architecture notes](../docs/architecture.md#host-input-route).
 
 The indicator is allowed only for the owned ScreenCaptureKit observation path.
 Each capture excludes the complete running Fruitctl Host application, identified
@@ -125,6 +134,7 @@ connection's lease, ends.
 | `ax_snapshot` | `session_id`, optional `depth` (1–12; default 6) and boolean `focused_app` (default `true`: frontmost application only; `false`: every regular visible application). Requires the same live ready lease as capture and the Accessibility grant. Reads the live tree off the main thread within a 200 ms budget, breadth first, at most 1,500 nodes and 200 children per element. Returns readiness plus `ax_snapshot`. |
 | `ax_action` | `session_id`, `generation` (from the latest `ax_snapshot` of this lease), `ref`, `action` (`press` or `focus`), optional boolean `vnc_fallback`. Requires the same live ready lease, the Accessibility grant and no other capture or AX work in flight. Reads the element off the main thread, re-checks the lease, Stop latch and display, then makes exactly one AX call on the main thread: `AXPress` (or `AXShowMenu` for a menu-bar item without it) or `AXFocused` (or `AXRaise` for a window). It then polls the element for up to 250 ms in total. Returns readiness plus `ax_action`. |
 | `ax_verify` | `session_id`, `generation`, `ref`, `action`, matching the one `ax_action` that returned `vnc_click_required`. Consumes that record and polls the element against its pre-click state. Returns readiness plus `ax_verify: {ref, action, generation, verified}`. |
+| `input` | `session_id`, `kind` (`click`, `double_click`, `triple_click`, `move`, `drag`, `scroll`, `key`, `type` or `activate`) and `target: {bundle_id, pid?, window_title?}`. Pointer kinds take framebuffer pixels `x`, `y` (`to_x`, `to_y` for drag), optional `button` and `modifiers`. `scroll` takes `direction` and `amount` (1 to 20). `key` takes `keys`, modifiers first and then one key. `type` takes `text`, at most 64 characters. Optional `operator_input` (`yield` or `assert`) and `operator_idle_ms` (0 to 10,000). Requires the local input opt-in, the Accessibility grant and the same live ready lease as `ax_action`. Returns readiness plus `input: {kind, posted_events, completed, stop_reason?, released_events, operator_input_events, operator_input_monitor, frontmost_pid, frontmost_bundle_id}`. |
 | `export_idle_reference` | `instance_id` must match the resident app; `reference_id` must match the transient local-menu arm reported by `health`. Optional display/backend must match configuration. Consumes the arm once and exports one full-native PNG plus a hashed private receipt while naturally idle. Creates no lease, readiness or input observation. |
 
 Unknown actions, including OCR, diff, ordinary baseline and custom input, fail explicitly

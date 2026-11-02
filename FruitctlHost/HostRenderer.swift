@@ -47,6 +47,10 @@ final class HostRenderer {
         }
     }
 
+    /// Window numbers of the click-through indicator panels, the only own
+    /// windows the input route may look through (#157 review).
+    var panelWindowNumbers: Set<Int> { Set(panels.map(\.windowNumber)) }
+
     var hasAllDisplayPanels: Bool { !panels.isEmpty && panels.count == NSScreen.screens.count }
 
     var hasAnyVisiblePanels: Bool { panels.contains { $0.isVisible } }
