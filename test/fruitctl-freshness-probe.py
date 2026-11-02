@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import selectors
 import stat
 import struct
 import subprocess
@@ -429,6 +430,7 @@ class DaemonSession:
         self.messages = queue.Queue()
         self.notifications = []
         self.ledger = []
+        self.last_ledger_position = 0
         self.gate_leak_logs = 0
         self.stderr_lines = 0
         self.identifier = 0
@@ -460,8 +462,7 @@ class DaemonSession:
             if read_fd is not None:
                 os.close(read_fd)
             os.close(write_fd)
-        self.readers = [threading.Thread(target=self._stdout, daemon=True),
-                        threading.Thread(target=self._stderr, daemon=True)]
+        self.readers = [threading.Thread(target=self._outputs, daemon=True)]
         for reader in self.readers:
             reader.start()
         self.ready = None
@@ -474,38 +475,81 @@ class DaemonSession:
             self.broken = str(error)[:160]
             raise
 
-    def _stdout(self):
-        try:
-            while True:
-                line = self.process.stdout.readline(MAX_LINE + 1)
-                if not line:
-                    self.messages.put((self.clock(), EOFError("daemon output ended")))
-                    return
-                if len(line) > MAX_LINE or not line.endswith(b"\n"):
-                    raise ValueError("unbounded or incomplete NDJSON")
-                self.messages.put((self.clock(), json.loads(line)))
-        except Exception as error:
-            self.messages.put((self.clock(), error))
+    def _record_stderr(self, raw):
+        line = raw.decode("utf-8", errors="replace").rstrip("\n")
+        if line.startswith("[RFB-WIRE]"):
+            self.ledger_file.write(line + "\n")
+            entry = parse_wire_line(line)
+            if entry is not None:
+                entry["arrived"] = self.clock()
+                self.ledger.append(entry)
+        else:
+            self.stderr_lines += 1
+            if GATE_LEAK_LOG in line:
+                self.gate_leak_logs += 1
+            if self.stderr_lines <= 20000:
+                self.stderr_file.write(line + "\n")
 
-    def _stderr(self):
-        while True:
-            raw = self.process.stderr.readline(MAX_STDERR_LINE)
-            if not raw:
-                return
-            arrived = self.clock()
-            line = raw.decode("utf-8", errors="replace").rstrip("\n")
-            if line.startswith("[RFB-WIRE]"):
-                self.ledger_file.write(line + "\n")
-                entry = parse_wire_line(line)
-                if entry is not None:
-                    entry["arrived"] = arrived
-                    self.ledger.append(entry)
-            else:
-                self.stderr_lines += 1
-                if GATE_LEAK_LOG in line:
-                    self.gate_leak_logs += 1
-                if self.stderr_lines <= 20000:
-                    self.stderr_file.write(line + "\n")
+    def _outputs(self):
+        # Native wire writes precede the corresponding stdout response.
+        # One reader drains that causal stderr prefix before publishing it.
+        # The pipes remain separate, so image JSON cannot interleave with logs.
+        streams = {"stdout": self.process.stdout, "stderr": self.process.stderr}
+        buffers = {name: bytearray() for name in streams}
+        active = set(streams)
+        with selectors.DefaultSelector() as selector:
+            for name, stream in streams.items():
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+
+            def publish(message):
+                self.messages.put((self.clock(), message, len(self.ledger)))
+
+            def consume(name):
+                if name not in active:
+                    return
+                buffer = buffers[name]
+                limit = MAX_LINE if name == "stdout" else MAX_STDERR_LINE
+                while True:
+                    try:
+                        chunk = os.read(streams[name].fileno(), 65536)
+                    except BlockingIOError:
+                        return
+                    if not chunk:
+                        active.remove(name)
+                        selector.unregister(streams[name])
+                        if buffer:
+                            if name == "stdout":
+                                raise ValueError("unbounded or incomplete NDJSON")
+                            self._record_stderr(bytes(buffer))
+                            buffer.clear()
+                        if name == "stdout":
+                            consume("stderr")
+                            publish(EOFError("daemon output ended"))
+                        return
+                    buffer.extend(chunk)
+                    while True:
+                        end = buffer.find(b"\n")
+                        if end < 0:
+                            break
+                        if end + 1 > limit:
+                            raise ValueError("unbounded %s line" % name)
+                        raw = bytes(buffer[:end + 1])
+                        del buffer[:end + 1]
+                        if name == "stderr":
+                            self._record_stderr(raw)
+                        else:
+                            consume("stderr")
+                            publish(json.loads(raw))
+                    if len(buffer) >= limit:
+                        raise ValueError("unbounded %s line" % name)
+
+            try:
+                while active:
+                    for key, _ in selector.select():
+                        consume(key.data)
+            except Exception as error:
+                publish(error)
 
     def _note(self, arrived, message):
         if message.get("method") == "vnc_state":
@@ -519,7 +563,7 @@ class DaemonSession:
             if remaining <= 0:
                 raise TimeoutError("daemon ready timed out after %d s" % timeout)
             try:
-                arrived, message = self.messages.get(timeout=remaining)
+                arrived, message, ledger_position = self.messages.get(timeout=remaining)
             except queue.Empty:
                 continue
             if isinstance(message, Exception):
@@ -550,20 +594,21 @@ class DaemonSession:
                 self.broken = "runner_timeout"
                 raise TimeoutError(self.broken)
             try:
-                arrived, message = self.messages.get(timeout=remaining)
+                arrived, message, ledger_position = self.messages.get(timeout=remaining)
             except queue.Empty:
                 continue
             if isinstance(message, Exception):
                 self.broken = "daemon_exited"
                 raise RuntimeError(self.broken)
             if message.get("id") == self.identifier:
+                self.last_ledger_position = ledger_position
                 return message
             self._note(arrived, message)
 
     def drain(self):
         while True:
             try:
-                arrived, message = self.messages.get_nowait()
+                arrived, message, _ = self.messages.get_nowait()
             except queue.Empty:
                 return
             if isinstance(message, Exception):
@@ -619,6 +664,7 @@ def observe(session, step_index, step, start_clock, options, output_dir, images=
                                   "allocation": result.get("allocation")}
     except Exception as error:
         record["healthBefore"] = {"error": str(error)[:120]}
+    ledger_start = session.last_ledger_position
     start = session.clock()
     record["t"] = round(start - start_clock, 3)
     try:
@@ -626,11 +672,11 @@ def observe(session, step_index, step, start_clock, options, output_dir, images=
     except Exception as error:
         record["latency_ms"] = round((session.clock() - start) * 1000, 3)
         record["reason"] = str(error)[:120]
-        record["window"] = (start, session.clock())
+        record["ledgerWindow"] = (ledger_start, session.last_ledger_position)
         return record
     end = session.clock()
     record["latency_ms"] = round((end - start) * 1000, 3)
-    record["window"] = (start, end)
+    record["ledgerWindow"] = (ledger_start, session.last_ledger_position)
     error = response.get("error")
     if error:
         record["errorCode"] = error.get("code")
@@ -665,24 +711,24 @@ def observe(session, step_index, step, start_clock, options, output_dir, images=
 
 
 def attribute_ledger(captures, sessions):
-    """Count wire requests written inside each capture window (arrival time).
+    """Count independently parsed wire entries between matched response prefixes.
 
-    A window ends 0.5 s after the response, or at the next capture's start on
-    the same session, so stderr/stdout reader skew cannot double count.
+    The health reply fixes the starting prefix. The screenshot reply fixes
+    its end after the reader has drained already-written stderr. Local reader
+    arrival times and rounded daemon milliseconds cannot move an entry.
     """
     by_index = {session.index: session for session in sessions}
-    windows = [(record, record.pop("window", None)) for record in captures]
-    for position, (record, window) in enumerate(windows):
+    for record in captures:
         session = by_index.get(record["session"])
-        if window is None or session is None:
+        window = record.pop("ledgerWindow", None)
+        if session is None or window is None:
             continue
-        start, end = window[0], window[1] + 0.5
-        for later, later_window in windows[position + 1:]:
-            if later["session"] == record["session"] and later_window is not None:
-                end = min(end, later_window[0])
-                break
-        inside = [e for e in session.ledger if e["type"] == 3 and start <= e["arrived"] <= end]
+        start, end = window
+        if not (type(start) is int and type(end) is int and 0 <= start <= end <= len(session.ledger)):
+            continue
+        inside = [entry for entry in session.ledger[start:end] if entry["type"] == 3]
         record["ledger"] = {
+            "entryStart": start, "entryEnd": end,
             "fullRequests": sum(1 for e in inside if e["incremental"] == "0" and e["origin"] == "bridge"),
             "incrementalRequests": sum(1 for e in inside if e["incremental"] == "1" and e["origin"] != "suppressed"),
             "suppressed": sum(1 for e in inside if e["origin"] == "suppressed")}
@@ -776,6 +822,13 @@ def evaluate(probe, mode, captures, sessions, eq=None):
         ledger = session.get("ledger") or {}
         if ledger.get("inputLines"):
             reasons.append("session %d: input appeared on the wire ledger" % session["index"])
+        total = ledger.get("fullBridge")
+        counts = [(r.get("ledger") or {}).get("fullRequests") for r in captures
+                  if r["session"] == session["index"]]
+        assigned = sum(value for value in counts if type(value) is int)
+        if type(total) is int and total != assigned:
+            reasons.append("session %d: %d full wire requests, %d assigned to capture response prefixes"
+                           % (session["index"], total, assigned))
     if probe in ("P0", "P1"):
         for record in captures:
             if not record["ok"]:
