@@ -22,7 +22,11 @@ The source targets Apple silicon macOS 15 or later. Check the
 | Optional Fruitctl Host on the target | The target user enables capture and grants that app Screen Capture and Accessibility access. |
 
 The Host source supplies images, an Accessibility snapshot, element actions and
-an indicator. It has no local input service and posts no synthetic events. The
+an indicator. Its input service posts synthetic events only for a Host-only
+target with `hostInput`, after the local **Enable agent input** choice. The same
+Accessibility grant allows posting. Input Monitoring is optional: with it, the
+operator-input tap also sees keyboard events. Without that service the Host
+posts no synthetic events. The
 Accessibility grant serves two purposes: reading the tree for `ax_snapshot`, and
 `click_element` / `focus_element`, which ask one element from the latest snapshot
 to perform `AXPress` or set `AXFocused`. Those element actions run only under the
@@ -31,8 +35,8 @@ element cannot perform the action, the controller sends one VNC click at the
 element's centre through its ordinary input path. The Accessibility grant is
 expected on a standard Host install (D10). Without it, capture still works, and
 `ax_snapshot`, `click_element` and `focus_element` fail with the typed code
-`accessibility_permission_required`. The Host requests no event-posting, input
-monitoring, microphone or Full Disk Access policy. VNC input remains with the
+`accessibility_permission_required`. The Host never prompts for a grant and
+requests no microphone or Full Disk Access policy. VNC input remains with the
 controller and the target's Screen Sharing service.
 
 ## Unmanaged target: attended Host setup

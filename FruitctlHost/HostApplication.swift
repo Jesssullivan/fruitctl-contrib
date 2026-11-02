@@ -1,10 +1,14 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Darwin
 
 struct HostOptions {
     var captureChoice: Bool?
+    /// Local agent-input opt-in (#157); off unless an attended launch or
+    /// the local menu enables it.
+    var inputChoice: Bool?
     var displayID: CGDirectDisplayID?
     /// Canonical display UUID; resolved against the online display list at
     /// launch and again after every display reconfiguration.
@@ -28,6 +32,9 @@ struct HostOptions {
             case "--enable-capture", "--disable-capture":
                 guard options.captureChoice == nil else { throw HostLeaseError.invalidParameters }
                 options.captureChoice = arguments[index] == "--enable-capture"
+            case "--enable-input", "--disable-input":
+                guard options.inputChoice == nil else { throw HostLeaseError.invalidParameters }
+                options.inputChoice = arguments[index] == "--enable-input"
             case "--request-screen-capture": options.requestPermission = true
             case "--display-id":
                 index += 1
@@ -47,7 +54,8 @@ struct HostOptions {
             }
             index += 1
         }
-        guard options.mode == .application || (options.captureChoice == nil && !options.requestPermission),
+        guard options.mode == .application || (options.captureChoice == nil && options.inputChoice == nil
+                                                && !options.requestPermission),
               !options.requestPermission || options.captureChoice == true else {
             throw HostLeaseError.invalidParameters
         }
@@ -74,6 +82,10 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private var captureInProgress = false
     private var axSnapshotInProgress = false
     private var axActionInProgress = false
+    private var inputInProgress = false
+    private let inputPreferences: HostInputPreferences
+    private let inputPoster = HostSystemInputPoster()
+    private lazy var inputMonitor = HostOperatorInputMonitor(clock: { [clock] in clock.milliseconds() })
     /// The latest successful AX snapshot of the current activity; refs in
     /// click_element/focus_element resolve only against it.
     private var axGeneration: HostAXGeneration?
@@ -91,6 +103,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private var allowMenuItem: NSMenuItem?
     private var enableCaptureMenuItem: NSMenuItem?
     private var disableCaptureMenuItem: NSMenuItem?
+    private var enableInputMenuItem: NSMenuItem?
+    private var disableInputMenuItem: NSMenuItem?
     private var idleReferenceMenuItem: NSMenuItem?
     private var idleReferenceStatusMenuItem: NSMenuItem?
     private lazy var idleReference = HostIdleReferenceCoordinator(
@@ -113,6 +127,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         self.options = options
         let preferences = HostCapturePreferences(startupChoice: options.captureChoice)
         capturePreferences = preferences
+        inputPreferences = HostInputPreferences(startupChoice: options.inputChoice)
         let authorization = HostCapturePermission.system()
         permission = authorization
         let displayID = options.displayID ?? CGMainDisplayID()
@@ -164,6 +179,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             MainActor.assumeIsolated { self?.tick() }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
+        if inputPreferences.isEnabled { inputMonitor.start() }
         observeDisplayAndSession()
         for number in [SIGTERM, SIGINT] {
             signal(number, SIG_IGN)
@@ -211,6 +227,12 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         let disable = NSMenuItem(title: "Disable capture", action: #selector(disableCapture(_:)),
                                  keyEquivalent: "")
         disable.target = self
+        let enableInput = NSMenuItem(title: "Enable agent input", action: #selector(enableInput(_:)),
+                                     keyEquivalent: "")
+        enableInput.target = self
+        let disableInput = NSMenuItem(title: "Disable agent input", action: #selector(disableInput(_:)),
+                                      keyEquivalent: "")
+        disableInput.target = self
         let reference = NSMenuItem(title: "Arm one idle reference export (60s)",
                                    action: #selector(armIdleReference(_:)), keyEquivalent: "")
         reference.target = self
@@ -220,11 +242,13 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                   keyEquivalent: "")
         identity.isEnabled = false
         menu.addItem(stop); menu.addItem(allow); menu.addItem(.separator())
-        menu.addItem(enable); menu.addItem(disable); menu.addItem(reference); menu.addItem(referenceStatus)
+        menu.addItem(enable); menu.addItem(disable); menu.addItem(enableInput); menu.addItem(disableInput)
+        menu.addItem(reference); menu.addItem(referenceStatus)
         menu.addItem(.separator()); menu.addItem(identity); menu.addItem(quit)
         item.menu = menu
         statusItem = item; stopMenuItem = stop; allowMenuItem = allow
         enableCaptureMenuItem = enable; disableCaptureMenuItem = disable
+        enableInputMenuItem = enableInput; disableInputMenuItem = disableInput
         idleReferenceMenuItem = reference; idleReferenceStatusMenuItem = referenceStatus
         updateHumanControl()
     }
@@ -234,6 +258,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         allowMenuItem?.isEnabled = !availability.humanAllowed
         enableCaptureMenuItem?.isEnabled = !capturePreferences.isEnabled
         disableCaptureMenuItem?.isEnabled = capturePreferences.isEnabled
+        enableInputMenuItem?.isEnabled = !inputPreferences.isEnabled
+        disableInputMenuItem?.isEnabled = inputPreferences.isEnabled
         idleReferenceMenuItem?.isEnabled = capturePreferences.isEnabled && permission.isGranted
             && idleReferenceConditions.isIdle && !idleReference.isExporting
         updateIdleReferencePresentation()
@@ -294,6 +320,20 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     @objc private func disableCapture(_ sender: Any?) {
         capturePreferences.setEnabled(false)
         invalidateActivity(reason: .captureDisabled)
+        updateHumanControl()
+    }
+
+    @objc private func enableInput(_ sender: Any?) {
+        // Opt-in alone creates no lease and posts nothing; it requests no
+        // Accessibility prompt. A controller still needs a fresh activity.
+        inputPreferences.setEnabled(true)
+        inputMonitor.start()
+        updateHumanControl()
+    }
+
+    @objc private func disableInput(_ sender: Any?) {
+        // An action in flight re-checks this before its next event.
+        inputPreferences.setEnabled(false)
         updateHumanControl()
     }
 
@@ -541,8 +581,14 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["idle_reference_exporting"] = .boolean(idleReference.isExporting)
                 status["capabilities"] = .array(["capture", "begin_activity", "renew_activity",
                                                  "release_activity", "export_idle_reference",
-                                                 "ax_snapshot", "ax_action"].map { .string($0) })
-                status["input_service"] = .boolean(false)
+                                                 "ax_snapshot", "ax_action", "input"].map { .string($0) })
+                // #157: input posts CGEvents only under the local opt-in,
+                // the Accessibility grant and a live, indicated lease.
+                status["input_service"] = .boolean(inputPreferences.isEnabled)
+                status["input_enabled"] = .boolean(inputPreferences.isEnabled)
+                status["input_post_permission"] = .boolean(HostSystemInputPoster.permitted)
+                status["operator_input_monitor"] = .string(inputMonitor.mode)
+                status["secure_input"] = .boolean(IsSecureEventInputEnabled())
                 // Requests on one connection are answered as each completes.
                 status["request_pipelining"] = .boolean(true)
                 // Capture and AX replies may be split with reply_part_bytes.
@@ -615,7 +661,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                             displayGeneration: generation, now: now)
                 guard HostLeaseState.isReady(now: now, uiHeartbeatAt: lastUIHeartbeat,
                     captureReady: captureReady, overlayReady: overlayReady && renderer.hasVisibleDisplayPanels),
-                    !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !idleReference.isExporting else {
+                    !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+                    !idleReference.isExporting else {
                     throw HostLeaseError.notReady
                 }
                 captureInProgress = true
@@ -648,7 +695,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                                             displayGeneration: generation, now: now)
                 guard HostLeaseState.isReady(now: now, uiHeartbeatAt: lastUIHeartbeat,
                     captureReady: captureReady, overlayReady: overlayReady && renderer.hasVisibleDisplayPanels),
-                    !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !idleReference.isExporting else {
+                    !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+                    !idleReference.isExporting else {
                     throw HostLeaseError.notReady
                 }
                 guard accessibility.isTrusted() else { throw HostAccessibilityError.permissionRequired }
@@ -697,6 +745,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 return .ok(request, try await axAction(request, connectionID: connectionID))
             case "ax_verify":
                 return .ok(request, try await axVerify(request, connectionID: connectionID))
+            case "input":
+                return .ok(request, try await hostInput(request, connectionID: connectionID))
             case "export_idle_reference":
                 try validateDisplay(request)
                 guard try request.requiredString("instance_id") == instanceID else {
@@ -727,6 +777,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             return .failure(id: request.id, message: error.rawValue)
         } catch let error as HostAXActionError {
             return .failure(id: request.id, message: error.rawValue)
+        } catch let error as HostInputError {
+            return .failure(id: request.id, message: error.rawValue)
         } catch {
             return .failure(id: request.id, message: "host_action_failed")
         }
@@ -745,7 +797,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         let displayID = capture.displayID
         guard let geometry = HostDisplayGeometry.current(displayID) else { throw HostCaptureError.displayUnavailable }
         _ = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID, geometry: geometry)
-        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !idleReference.isExporting else {
+        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+                    !idleReference.isExporting else {
             throw HostLeaseError.notReady
         }
         guard let snapshot = axGeneration else { throw HostAXActionError.staleRef }
@@ -835,7 +888,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         let displayID = capture.displayID
         guard let geometry = HostDisplayGeometry.current(displayID) else { throw HostCaptureError.displayUnavailable }
         _ = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID, geometry: geometry)
-        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !idleReference.isExporting else {
+        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+                    !idleReference.isExporting else {
             throw HostLeaseError.notReady
         }
         guard let pending = axPendingVerification, pending.matches(axRequest) else {
@@ -868,6 +922,99 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         }
     }
 
+    /// #157: one pointer or keyboard action, or one activation, posted as
+    /// CGEvents by this process. Each event is preceded by the lease check
+    /// (Stop, display, indicator heartbeat, grant, opt-in) and the gate
+    /// (secure input, frontmost target, window owner, consent dialogs,
+    /// operator input), all on the main actor. Refusals before the first
+    /// event keep the lease; a stop after it releases what it pressed and
+    /// reports `completed: false` with the count it posted.
+    private func hostInput(_ request: HostRequest, connectionID: UUID) async throws -> [String: HostValue] {
+        try validateDisplay(request)
+        try requireAvailable()
+        let input = try HostInputRequest.parse(request.params)
+        let session = try request.requiredString("session_id")
+        let displayID = capture.displayID
+        guard let geometry = HostDisplayGeometry.current(displayID) else { throw HostCaptureError.displayUnavailable }
+        _ = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID, geometry: geometry)
+        guard inputPreferences.isEnabled else { throw HostInputError.disabled }
+        guard HostSystemInputPoster.permitted else { throw HostInputError.permissionRequired }
+        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+              !idleReference.isExporting else { throw HostLeaseError.notReady }
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        inputMonitor.start()
+        inputInProgress = true
+        defer { inputInProgress = false }
+        let leaseCheck: HostInputSession.Check = { [unowned self] in
+            _ = try self.requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                        geometry: geometry)
+            guard self.inputPreferences.isEnabled else { throw HostInputError.disabled }
+        }
+        let read: @MainActor (CGPoint?, Bool) -> HostInputEnvironment = { [unowned self] point, start in
+            HostSystemInputEnvironment.read(point: point, start: start, keyboard: !input.kind.pointer,
+                wantsTitle: input.target.windowTitle != nil,
+                executable: { self.accessibility.executableName(processID: $0) },
+                monitor: self.inputMonitor, now: self.clock.milliseconds())
+        }
+        let pause: (UInt64) async -> Void = { milliseconds in
+            try? await Task.sleep(nanoseconds: milliseconds * 1_000_000)
+        }
+        do {
+            let outcome: HostInputSession.Outcome
+            if input.kind == .activate {
+                outcome = try await activate(input, lease: leaseCheck, read: read, pause: pause)
+            } else {
+                outcome = try await HostInputSession(poster: inputPoster, environment: read, monitor: inputMonitor,
+                    now: { [clock] in clock.milliseconds() }, sleep: pause).run(input, steps: steps, lease: leaseCheck)
+            }
+            let current = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                              geometry: geometry)
+            let frontmost = NSWorkspace.shared.frontmostApplication.map {
+                HostInputProcess(processID: $0.processIdentifier, bundleID: $0.bundleIdentifier, executable: nil)
+            }
+            return readiness(now: clock.milliseconds(), activity: current).merging(["input": .object(
+                outcome.metadata(input, frontmost: frontmost, monitor: inputMonitor.mode))]) { _, value in value }
+        } catch let refusal as HostInputError {
+            // Raised before the first event: nothing was posted.
+            throw refusal
+        } catch let refusal as HostAXActionError {
+            throw refusal
+        } catch {
+            if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+            throw error
+        }
+    }
+
+    /// Makes the one running regular application with the target bundle ID
+    /// frontmost, through AXFrontmost (the Accessibility grant), then
+    /// NSRunningApplication. Posts no event; polls for up to 500 ms.
+    private func activate(_ input: HostInputRequest, lease: HostInputSession.Check,
+                          read: @MainActor (CGPoint?, Bool) -> HostInputEnvironment,
+                          pause: (UInt64) async -> Void) async throws -> HostInputSession.Outcome {
+        try lease()
+        try HostInputGate.check(input, read(nil, true), start: true, pointerCheck: false)
+        let candidates = NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == input.target.bundleID && $0.activationPolicy == .regular && !$0.isTerminated
+                && (input.target.processID == nil || $0.processIdentifier == input.target.processID)
+        }
+        guard candidates.count == 1, let target = candidates.first else { throw HostInputError.targetMismatch }
+        var outcome = HostInputSession.Outcome()
+        let frontmost = { NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier }
+        if !frontmost() {
+            let element = AXUIElementCreateApplication(target.processIdentifier)
+            if AXUIElementSetAttributeValue(element, kAXFrontmostAttribute as CFString, kCFBooleanTrue) != .success {
+                _ = target.activate(options: [.activateAllWindows])
+            }
+        }
+        for _ in 0..<20 where !frontmost() {
+            await pause(25)
+            try lease()
+        }
+        outcome.completed = frontmost()
+        if !outcome.completed { outcome.stopReason = "activation_unconfirmed" }
+        return outcome
+    }
+
     static func writeError(_ message: String) {
         try? FileHandle.standardError.write(contentsOf: Data(message.utf8))
     }
@@ -887,6 +1034,7 @@ struct FruitctlHostMain {
                 print("""
                 FruitctlHost — optional macOS human activity indicator and owned SCK capture
                 Usage: FruitctlHost [--enable-capture | --disable-capture] [--request-screen-capture]
+                                    [--enable-input | --disable-input]
                                     [--display-id ID | --display-uuid UUID]
                        FruitctlHost --stdio
                        FruitctlHost --doctor
@@ -897,8 +1045,9 @@ struct FruitctlHostMain {
                 The local menu can enable/disable capture; IPC cannot change the opt-in.
                 Permission requests require the explicit
                 --enable-capture --request-screen-capture attended application flags.
-                Raw VNC exclusion is unsupported. Input stays on the controlling Darwin seat;
-                the Host performs only single Accessibility element actions under a lease.
+                Raw VNC exclusion is unsupported. With the local input opt-in (--enable-input or
+                the menu) and the Accessibility grant, the Host posts pointer and keyboard events
+                for one lease-holding controller, only while its indicator is shown.
                 """)
             case .doctor:
                 var info = stat()

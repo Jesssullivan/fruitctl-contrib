@@ -106,6 +106,17 @@ Host-only target clears there; other targets need a reconciled broker restart.
 Use `menu_extras: true` on `ax_snapshot` to reach menu-bar extras and Control
 Center.
 
+On a Host-only target with `hostInput`, `mouse_click`, `mouse_double_click`,
+`triple_click`, `mouse_move`, `hover`, `mouse_drag`, `scroll`, `key_tap`,
+`key_combo` and `key_type` run in FruitctlHost. Their coordinates are the
+screenshot's. Call `activate_app` first when the target is not frontmost.
+Each result carries a fresh readback frame; inspect it before the next step.
+`input_target_mismatch` means another app or window is in front.
+`secure_input_active` means a password field is focused; never work around it.
+`operator_input_detected` means the operator is using the machine; wait and
+take a new screenshot. `input_interrupted` reports how many events were posted
+before the stop; do not repeat the action blindly.
+
 ## Computer-use alias
 
 `computer` accepts the Anthropic `computer` tool and OpenAI `computer_call`

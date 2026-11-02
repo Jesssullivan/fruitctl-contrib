@@ -407,6 +407,47 @@ receipt with `reconciled`, the first cause and the Host's readback, and exits
 `reconcile_refused`. A VNC lane refuses with `reconcile_unsupported`, because
 its native process needs the reconciled broker restart.
 
+## Host input route
+
+A Host-only target whose profile sets `hostInput` lets FruitctlHost post the
+VNC schema's pointer and key actions itself (#157). The actions are
+`mouse_click`, `mouse_double_click`, `triple_click`, `mouse_move`, `hover`,
+`mouse_drag`, `scroll`, `key_tap`, `key_combo` and `key_type`, plus
+`activate_app`. Coordinates are in the agent's screenshot space. The broker maps
+each one to the centre of a framebuffer pixel, and the Host maps that pixel to a
+global point. `paste`, `type_secret`, holds and `clipboard_read` stay refused
+on this route.
+
+```json
+{ "transport": "host-only", "targetId": "neo", "hostHelperFile": "/private/binding.json",
+  "hostInput": { "applications": ["com.apple.logic10"], "operatorInput": "yield", "operatorIdleMs": 1000 } }
+```
+
+| Gate | Where | Refusal |
+| --- | --- | --- |
+| Operator policy names the app | broker | `input_target_not_allowed` |
+| Local "Enable agent input" opt-in | Host, before every event | `input_disabled` |
+| Accessibility grant (`CGPreflightPostEventAccess`) | Host | `input_permission_required` |
+| Live lease, fresh indicator heartbeat, unchanged display, no Stop | Host, before every event | the lease error ends the action |
+| `IsSecureEventInputEnabled`, or a focused secure text field | Host, before every event | `secure_input_active` |
+| Frontmost app is the target; optional pid and window title | Host, before every event | `input_target_mismatch` |
+| Window under each press belongs to the target, its Save or Open panel, or the menu bar | Host | `input_window_mismatch` |
+| Consent and authorization dialog owners | Host | `human_consent_required` |
+| Operator input: `yield` refuses or stops, `assert` continues and counts | Host | `operator_input_detected` |
+
+A refusal before the first event keeps the lease and is that action's error
+response. A stop after some events releases every button and key the Host
+pressed, then reports `input_interrupted` with the count it posted. Nothing is
+replayed. A completed action returns one fresh Host frame as its readback.
+
+Events come from a private event source and carry a Host tag. A listen-only
+session event tap counts input without that tag as operator input. Without
+Input Monitoring the tap sees pointer events only, and keyboard events fall
+back to event times compared with the Host's own posts. Health reports which
+method runs as `operator_input_monitor`. Operator input just before a Host
+event can be masked by that fallback. Qualification of the tap, timing and
+Space behaviour on a live desktop is an attended gate.
+
 ## Error codes
 
 The native daemon, FruitctlHost, the Darwin broker, the Linux relay and the
@@ -449,6 +490,15 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `ax_action_unsupported` | Host | The element does not offer the action |
 | `credential_unavailable` | broker | The VNC credential provider failed at startup |
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
+| `invalid_input` | broker | A Host input action's coordinates, keys, text or scroll are invalid; nothing was sent |
+| `input_target_not_allowed` | broker | The action's `app` is not one of the target's `hostInput.applications` |
+| `input_disabled` | broker, Host | The FruitctlHost menu's agent input opt-in is off |
+| `input_permission_required` | broker, Host | FruitctlHost may not post events; it lacks the Accessibility grant |
+| `secure_input_active` | Host | Secure event input is on, or the focused element is a password field |
+| `input_target_mismatch` | Host | The frontmost application, process or window is not the requested target |
+| `input_window_mismatch` | Host | The window under the pointer belongs to another process |
+| `operator_input_detected` | Host | Operator input arrived within the yield window |
+| `input_interrupted` | Host route | A Host input action stopped after posting some events; `data.reason`, `data.posted_events` |
 | `reconcile_refused` | broker | `fruitctl reconcile` found the lane closing, busy or changed |
 | `reconcile_unsupported` | broker | The latched lane cannot prove its own release; restart the reconciled broker |
 | `operation_failed` | broker | Any other error crossing the broker socket |

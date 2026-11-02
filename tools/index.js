@@ -51,10 +51,16 @@ const secretRef = () => z.string().regex(SECRET_NAME).optional()
 // An element ref from ax_snapshot. The two forms are disjoint (a secret name
 // has no colon), and each action accepts only its own.
 const AX_ELEMENT_REF = /^ax:[0-9]{1,10}:0(\.[0-9]{1,3}){0,12}$/;
+// #157: the application a Host-route input action is for, by bundle ID.
+const appBundle = () => z.string().regex(/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/).max(255).optional()
+  .describe('Host route input: target application bundle ID (default: the only hostInput application)');
 const commandRef = () => z.string()
   .regex(/^(?:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}|ax:[0-9]{1,10}:0(?:\.[0-9]{1,3}){0,12})$/).optional()
   .describe('type_secret: operator-allowlisted secret name (never the secret itself); ' +
     'click_element / focus_element: an element ref from the latest ax_snapshot');
+
+const HOST_APP_ACTIONS = new Set(['mouse_click', 'mouse_double_click', 'triple_click', 'mouse_move', 'hover',
+  'mouse_drag', 'scroll', 'key_tap', 'key_combo', 'key_type', 'activate_app']);
 
 export function validateActionParameters(input) {
   const required = {
@@ -94,6 +100,9 @@ export function validateActionParameters(input) {
   }
   if (input.format !== undefined && input.action !== 'screenshot') {
     throw new Error(`format applies only to screenshot, not ${input.action}`);
+  }
+  if (input.app !== undefined && !HOST_APP_ACTIONS.has(input.action)) {
+    throw new Error(`app applies only to Host route input, not ${input.action}`);
   }
   if (input.modifiers !== undefined && input.action !== 'mouse_click') {
     throw new Error(`modifiers apply only to mouse_click, not ${input.action}`);
@@ -163,6 +172,10 @@ export function vncCommandTool() {
       '  click_element  {ref}                    → Host route only: AXPress a ref from the latest',
       '                                            ax_snapshot; result names the path and verified',
       '  focus_element  {ref}                    → Host route only: focus a ref (AXFocused)',
+      '  activate_app   {app?}                   → Host route only: make the target app frontmost',
+      'On a Host-only target with hostInput, FruitctlHost posts the pointer and key actions itself',
+      '(optional app names the target). It refuses when that app is not frontmost, secure input is on,',
+      'or the operator is using the machine; each result carries a fresh readback frame.',
       '  configure      {<params>}               → set timing/display params at runtime',
       '  configure      {reset: true}            → reset all params to defaults',
       '  get_timing                              → get current timing + display params',
@@ -179,7 +192,7 @@ export function vncCommandTool() {
         'mouse_click', 'mouse_double_click', 'mouse_move', 'hover', 'nudge',
         'mouse_drag', 'scroll',
         'key_tap', 'key_combo', 'key_type', 'paste', 'type_secret', 'clipboard_read',
-        'detect_elements', 'ax_snapshot', 'click_element', 'focus_element',
+        'detect_elements', 'ax_snapshot', 'click_element', 'focus_element', 'activate_app',
         'configure', 'get_timing',
         'wait', 'health', 'shutdown',
         'triple_click', 'cursor_position', 'hold_key', 'mouse_down', 'mouse_up',
@@ -197,6 +210,7 @@ export function vncCommandTool() {
       keys: z.array(z.string()).optional().describe('Array of key names for combo (e.g. ["cmd","shift","3"])'),
       text: z.string().optional().describe('Text to type or paste'),
       ref: commandRef(),
+      app: appBundle(),
       direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
       amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
       ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),
@@ -273,6 +287,7 @@ export function actionQueueTool() {
     keys: z.array(z.string()).optional().describe('Array of key names for combo'),
     text: z.string().optional().describe('Text to type or paste'),
     ref: secretRef(),
+    app: appBundle(),
     direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
     amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
     ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),
