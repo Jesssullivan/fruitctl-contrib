@@ -29,6 +29,10 @@ test-freshness-probe node="node":
 test-host-permits node="node":
     {{quote(node)}} --test --test-isolation=none --test-concurrency=1 test/fruitctl-host-helper.test.js test/fruitctl-native-permit.test.js
 
+# Credential-free Host capture/AX transport and profile refusals; mock SSH only.
+test-host-only node="node":
+    {{quote(node)}} --test --test-concurrency=1 --test-name-pattern='Host-only' test/fruitctl-host-helper.test.js test/fruitctl-broker.test.js
+
 # Offline full-raster fixture and streaming-oracle checks; contacts no desktop.
 test-qualification node="node":
     {{quote(node)}} --test --test-concurrency=1 test/qualification.test.js test/qualification-stream.test.js test/qualification-overlay-gate.test.js test/qualification-live-kit.test.js

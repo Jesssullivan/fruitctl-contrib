@@ -9,7 +9,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHostHelperExecutor, HostHelperExecutor, hostHelperRefusalMessage, hostHelperFailureCause } from '../lib/broker/host-helper.mjs';
-import { createBroker, TargetLane } from '../lib/broker/server.mjs';
+import { nativeFactory, createBroker, TargetLane } from '../lib/broker/server.mjs';
 import { BrokerExecutor } from '../lib/broker/client.mjs';
 import { McpSession } from '../lib/mcp/server.js';
 import { ResponseBudget } from '../lib/mcp/protocol.js';
@@ -2072,5 +2072,127 @@ test('an unbranded initiating failure stays unknown when cleanup has a different
   } finally {
     await assert.rejects(lane.close(), error => error.code === 'release_unconfirmed');
     await tagger.close();
+  }
+});
+
+
+// An explicit Host-only target owns no VNC backend or credential provider.
+const hostOnlyProfile = () => ({ transport: 'host-only', targetId: 'configured-native-target',
+  hostHelper: configuration() });
+function hostOnlyFixture(options = {}) {
+  const ax = axActionHost(options);
+  const host = helper({ alter(request, response) {
+    const altered = ax.alter(request, response);
+    if (altered.success) {
+      altered.result.display_geometry = { pixel_width: 512, pixel_height: 256,
+        point_width: 256, point_height: 128, scale: 2 };
+      if (request.action === 'capture') Object.assign(altered.result,
+        { scaledWidth: 512, scaledHeight: 256, image: image(512, 256) });
+    }
+    return options.alter ? options.alter(request, altered) : altered;
+  } });
+  return host;
+}
+
+test('Host-only factory captures and acts through native AX with no VNC or provider fields', async () => {
+  const host = hostOnlyFixture();
+  const executor = await nativeFactory(hostOnlyProfile(), { hostSpawn: host.spawnImpl });
+  try {
+    assert.deepEqual(executor.display, { width: 512, height: 256 });
+    assert.deepEqual(executor.capabilities.native.actions, ['health', 'wait']);
+    assert.equal(executor.capabilities.actions.includes('mouse_click'), false);
+    const [health] = await executor.execute([{ action: 'health' }]);
+    assert.equal(health.result.transport, 'host-only');
+    assert.equal(health.result.vnc, false);
+    const [capture] = await executor.execute([{ action: 'screenshot' }]);
+    assert.equal(capture.result.scaledWidth, 512);
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    const [pressed] = await executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]);
+    assert.equal(pressed.result.ax_action.path, 'ax_press');
+    assert.equal(host.requests.find(request => request.action === 'ax_action').params.vnc_fallback, false);
+    assert.equal(host.launches.length, 1);
+    assert.equal(host.launches[0].command, 'ssh');
+    await executor.release();
+    assert.equal(executor.released, true);
+    assert.equal(host.state().lease_remaining_ms, 0);
+  } finally { await executor.close(); }
+});
+
+test('Host-only factory refuses all VNC events and clipboard before acquiring activity', async () => {
+  const host = hostOnlyFixture();
+  const executor = await nativeFactory(hostOnlyProfile(), { hostSpawn: host.spawnImpl });
+  try {
+    for (const action of ['mouse_click', 'key_tap', 'key_type', 'paste', 'type_secret',
+      'mouse_down', 'mouse_up', 'cursor_position', 'clipboard_read']) {
+      await assert.rejects(executor.execute([{ action }]), error =>
+        isPreAdmissionRefusal(error) && error.code === 'unsupported_on_route');
+    }
+    assert.deepEqual(host.requests.map(request => request.action), ['health']);
+  } finally { await executor.close(); }
+});
+
+test('Host-only rejects an unrequested VNC fallback and retires without a click', async () => {
+  const host = hostOnlyFixture({ outcome: params => ({ ref: params.ref, action: params.action,
+    generation: params.generation, path: 'vnc_click_required', surface: 'menu_extra',
+    role: 'AXMenuBarItem', fallback_point: { x: 100, y: 60 } }) });
+  const executor = await nativeFactory(hostOnlyProfile(), { hostSpawn: host.spawnImpl });
+  try {
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    await assert.rejects(executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]),
+      /Host-only transport refused a VNC fallback/);
+    assert.equal(executor.axVncFallback, false);
+    assert.equal(host.requests.some(request => request.action === 'ax_verify'), false);
+    assert.ok(executor.failed);
+    assert.equal(host.launches.length, 1);
+  } finally { await executor.close(); }
+});
+
+test('Host-only fails closed on a missing capture grant or missing Host', async () => {
+  const noGrant = hostOnlyFixture({ alter(request, response) {
+    if (request.action === 'health') response.result.screen_capture_permission = false;
+    return response;
+  } });
+  await assert.rejects(nativeFactory(hostOnlyProfile(), { hostSpawn: noGrant.spawnImpl }), /health binding/);
+  assert.equal(noGrant.launches.length, 1);
+  await assert.rejects(nativeFactory(hostOnlyProfile(), { hostSpawn() {
+    throw new Error('synthetic Host unavailable');
+  } }), /synthetic Host unavailable/);
+});
+
+test('Host-only preserves missing Accessibility and human Stop refusals', async () => {
+  const host = hostOnlyFixture();
+  const executor = await nativeFactory(hostOnlyProfile(), { hostSpawn: host.spawnImpl });
+  try {
+    executor.accessibilityTrusted = false;
+    await assert.rejects(executor.execute([{ action: 'ax_snapshot' }]), error => isPreAdmissionRefusal(error) && error.code === 'accessibility_permission_required');
+    executor.accessibilityTrusted = true;
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    executor.humanStopLatched = true;
+    await assert.rejects(executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]),
+      error => isPreAdmissionRefusal(error) && error.code === 'human_stop_latched');
+    assert.equal(host.requests.some(request => request.action === 'ax_action'), false);
+  } finally { await executor.close(); }
+});
+
+
+test('Host-only observations bind pixels and AX frames to the Host health geometry', async () => {
+  for (const kind of ['health', 'capture', 'ax_snapshot']) {
+    let changed = false;
+    const host = hostOnlyFixture({ alter(request, response) {
+      if (changed && request.action === kind) {
+        if (kind === 'health') response.result.display_geometry = { pixel_width: 512, pixel_height: 256,
+          point_width: 512, point_height: 256, scale: 1 };
+        if (kind === 'capture') Object.assign(response.result, { pixels_per_point_x: 1,
+          pixels_per_point_y: 1, display_bounds: { x: 0, y: 0, width: 512, height: 256 } });
+        if (kind === 'ax_snapshot') response.result.ax_snapshot.framebuffer.scale = 1;
+      }
+      return response;
+    } });
+    const executor = await nativeFactory(hostOnlyProfile(), { hostSpawn: host.spawnImpl });
+    try {
+      changed = true;
+      await assert.rejects(executor.execute([{ action: kind === 'capture' ? 'screenshot' : kind }]),
+        /Host-only (display|observation) geometry changed/);
+    } finally { await executor.close(); }
   }
 });
