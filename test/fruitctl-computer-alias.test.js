@@ -50,7 +50,7 @@ test('baseline actions are the vnc_command surface older backends shipped', () =
   for (const action of BASELINE_ACTIONS) assert.ok(surface.has(action), `${action} is not a vnc_command action`);
   // Newer methods stay outside the baseline: only advertised metadata enables them.
   assert.deepEqual([...surface].filter(action => !BASELINE_ACTIONS.has(action)).sort(),
-    ['activate_app', 'ax_snapshot', 'click_element', 'clipboard_read', 'cursor_position', 'focus_element', 'hold_key', 'mouse_down',
+    ['activate_app', 'ax_snapshot', 'click_element', 'clipboard_read', 'cursor_position', 'enter_element_value', 'focus_element', 'hold_key', 'mouse_down',
       'mouse_up', 'set_element_value', 'show_menu_element', 'step_element', 'triple_click', 'type_secret',
       'wait_for_stable', 'zoom']);
 });

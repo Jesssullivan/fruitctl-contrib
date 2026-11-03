@@ -524,6 +524,17 @@ Space behaviour on a live desktop is an attended gate.
 
 ### Element values
 
+`enter_element_value {ref, value, app?}` is for a control whose own value is not
+settable and which has an editable readout beside it, such as a Logic mixer fader
+(#181). `ref` names the readout, an `AXTextField` in the latest snapshot. The
+broker double-clicks its centre, types the number, presses Return and reads the
+readout back. `value` is at most 16 characters of a plain number in the readout's
+displayed unit. Each step is ordinary Host input, under every gate in the table
+above. The readback replaces the snapshot, so older refs go stale. A readout that
+does not show the number within its displayed decimals is `input_interrupted` with
+`reason: "value_not_verified"`. A stop after the field opened reports `entry_step`
+and leaves the field as it is.
+
 `set_element_value {ref, value, app?}` sets one element's `AXValue`, and
 `step_element {ref, steps, app?}` performs `AXIncrement` or `AXDecrement` up to
 10 times (#161). They need the same `hostInput` policy, local opt-in, live

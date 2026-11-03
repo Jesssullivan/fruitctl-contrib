@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { nativeFactory } from '../lib/broker/server.mjs';
 import { isPreAdmissionRefusal, requireNativeActions, INPUT_ACTIONS } from '../lib/mcp/capabilities.js';
 import { validateActionParameters } from '../tools/index.js';
-import { hostOnlyProfile, hostSequence, refusal } from './host-mock.mjs';
+import { hostOnlyProfile, hostSequence, refusal, snapshot } from './host-mock.mjs';
 
 const LOGIC = 'com.apple.logic10';
 const REF = 'ax:77:0.0';
@@ -202,4 +202,106 @@ test('a lease lost after an AX call retires the lane with the count', async () =
       /ax_value lease ended after 2 AX calls/);
     assert.ok(executor.failed);
   } finally { await executor.close(); }
+});
+
+// #181: a readout beside a control whose value is not settable.
+const READOUT = 'ax:77:0.0.1';
+const readoutHost = ({ value = '-6.0 dB', role = 'AXTextField', frame = { x: 100, y: 50, width: 40, height: 20 }, answer } = {}) => {
+  let reads = 0;
+  return hostSequence({ capabilities: ['input', 'capture_scope', 'ax_value'], health: { input_enabled: true,
+    input_post_permission: true, operator_input_monitor: 'event_tap' }, alter(request, response) {
+    if (request.action === 'input' && response.success) {
+      const custom = answer?.(request);
+      if (custom) return custom;
+      response.result.input = { kind: request.params.kind, posted_events: 2, released_events: 0, completed: true,
+        operator_input_events: 0, operator_input_monitor: 'event_tap',
+        target_bundle_id: request.params.target.bundle_id };
+    }
+    if (request.action === 'ax_snapshot' && response.success) {
+      reads += 1;
+      const first = reads === 1;
+      const node = { ref: first ? READOUT : 'ax:78:0', parent: null, depth: 0, role, label: 'volume fader level',
+        value: first ? '0.0 dB' : value, frame };
+      response.result.ax_snapshot = snapshot({ generation: first ? 77 : 78, node_count: 1, nodes: [node] });
+    }
+    return response;
+  } });
+};
+
+async function entryExecutor(options) {
+  const hosts = readoutHost(options);
+  const executor = await nativeFactory(hostOnlyProfile({ hostInput: { applications: [LOGIC] } }),
+    { hostSpawn: hosts.spawnImpl });
+  await executor.execute([{ action: 'ax_snapshot' }]);
+  return { executor, host: hosts.attachments[0] };
+}
+
+const inputs = host => host.requests.filter(request => request.action === 'input').map(request => request.params);
+
+test('enter_element_value opens the readout, types, commits and reads it back', async () => {
+  const { executor, host } = await entryExecutor();
+  try {
+    const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: -6 }]);
+    assert.equal(response.error, undefined);
+    assert.equal(response.result.ax_value.verified, true);
+    assert.equal(response.result.ax_value.value_after, '-6.0 dB');
+    assert.equal(response.result.ax_value.value_requested, '-6');
+    const sentInputs = inputs(host);
+    assert.deepEqual(sentInputs.map(params => params.kind), ['double_click', 'type', 'key']);
+    assert.equal(sentInputs[1].text, '-6');
+    assert.deepEqual(sentInputs[2].keys, ['return']);
+    // The Host takes depth from 1, and the readout is the subtree's first node.
+    const read = host.requests.filter(request => request.action === 'ax_snapshot').at(-1).params;
+    assert.deepEqual([read.root, read.depth, read.max_nodes], [READOUT, 1, 1]);
+    // The readback replaced the snapshot, so the old ref is stale.
+    assert.equal(executor.axRefs.has(READOUT), false);
+  } finally { await executor.close(); }
+});
+
+test('enter_element_value reports a readout that does not show the number', async () => {
+  const { executor } = await entryExecutor({ value: '0.0 dB' });
+  try {
+    const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: '-6' }]);
+    assert.equal(response.error.data.code, 'input_interrupted');
+    assert.equal(response.error.data.reason, 'value_not_verified');
+    assert.equal(response.error.data.value_after, '0.0 dB');
+    assert.equal(response.error.data.verified, false);
+    assert.equal(executor.failed, undefined);
+  } finally { await executor.close(); }
+});
+
+test('enter_element_value names the step a refusal stopped', async () => {
+  const { executor, host } = await entryExecutor({ answer: request => (request.params.kind === 'type'
+    ? refusal(request, 'input_focus_unavailable') : undefined) });
+  try {
+    const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: '-6' }]);
+    assert.equal(response.error.data.code, 'input_focus_unavailable');
+    assert.equal(response.error.data.entry_step, 'type');
+    assert.deepEqual(inputs(host).map(params => params.kind), ['double_click', 'type']);
+  } finally { await executor.close(); }
+});
+
+test('enter_element_value refuses before admission what it cannot type or open', async () => {
+  const { executor, host } = await entryExecutor();
+  try {
+    for (const value of ['abc', '1e5', '-6 dB', '12345678901234567', '-']) {
+      await assert.rejects(executor.execute([{ action: 'enter_element_value', ref: READOUT, value }]),
+        error => isPreAdmissionRefusal(error) && error.code === 'invalid_input');
+    }
+    assert.deepEqual(inputs(host), []);
+  } finally { await executor.close(); }
+  for (const options of [{ role: 'AXSlider' }, { frame: null }]) {
+    const other = await entryExecutor(options);
+    try {
+      await assert.rejects(other.executor.execute([{ action: 'enter_element_value', ref: READOUT, value: 1 }]),
+        error => isPreAdmissionRefusal(error) && error.code === 'ax_action_unsupported');
+      assert.deepEqual(inputs(other.host), []);
+    } finally { await other.executor.close(); }
+  }
+});
+
+test('the tool schema takes value for enter_element_value and needs a ref', () => {
+  assert.doesNotThrow(() => validateActionParameters({ action: 'enter_element_value', ref: READOUT, value: -6 }));
+  assert.throws(() => validateActionParameters({ action: 'enter_element_value', value: -6 }), /Missing ref/);
+  assert.throws(() => validateActionParameters({ action: 'enter_element_value', ref: READOUT }), /Missing value/);
 });
