@@ -418,6 +418,16 @@ each one to the centre of a framebuffer pixel, and the Host maps that pixel to a
 global point. `paste`, `type_secret`, holds and `clipboard_read` stay refused
 on this route.
 
+`mouse_drag` also takes `modifiers: ["shift"]`, held for the whole drag, for a
+plug-in's fine mode (#180). Other modifiers are refused: they turn a drag into
+another command, and with Escape, which cancels an interrupted drag, they can
+form a system shortcut. Instead of `toX` and `toY` a drag can take `fine_dx`
+and `fine_dy`: the end as an offset from the start in framebuffer pixels, from
+-64 to 64, not both zero. On a 2x display one framebuffer pixel is half a
+point, finer than one screenshot pixel. Whether a plug-in reads a movement under
+one point is up to the plug-in; check the readback frame. The VNC route refuses both with
+`unsupported_on_route`, because its daemon takes modifiers only on clicks.
+
 ```json
 { "transport": "host-only", "targetId": "neo", "hostHelperFile": "/private/binding.json",
   "hostInput": { "applications": ["com.apple.logic10"], "operatorInput": "yield", "operatorIdleMs": 1000 } }
@@ -465,6 +475,22 @@ means up to four events, which move the pointer back to the press point. When th
 itself ends mid-action, the reply names the count and the lane retires. Nothing
 is replayed. A completed action returns one fresh Host frame, taken at least
 150 ms after its last event, as its readback.
+
+### Activity after the agent stops
+
+A Host-only executor releases the Host activity (lease, indicator and element
+refs) 10 s after the agent's last request ends (#177). The lane keeps its owner
+and executor. The next request begins a new activity, which takes about half a
+second, so refs from before the gap are stale: take a new `ax_snapshot`. The
+target profile's `hostActivityIdleMs` sets the period: 0 keeps the activity
+until the lane releases, otherwise 1000 to 600000 ms. When the agent's broker
+connection closes, the lane releases at once, through the same path as a
+`close` frame. Before this, a stalled or vanished agent kept the indicator up
+until the 60 s owner lease ended. A VNC target keeps its activity for the lane's
+lifetime, because its native input permits follow the Host lease. If another
+session takes the Host's lease during the gap, the next batch is refused per
+call with `host_busy`, nothing is sent, and the lane is kept. A refused request
+and a health check do not hold the activity.
 
 Events come from a private event source and carry a Host tag. A listen-only
 session event tap counts input without that tag as operator input. Without
@@ -573,6 +599,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `credential_unavailable` | broker | The VNC credential provider failed at startup |
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
 | `invalid_input` | broker | A Host input action's coordinates, keys, text or scroll are invalid; nothing was sent |
+| `host_busy` | broker | After an idle release, another session holds the Host's lease; nothing was sent and the lane is kept |
 | `input_target_not_allowed` | broker | The action's `app` is not one of the target's `hostInput.applications` |
 | `input_disabled` | broker, Host | The FruitctlHost menu's agent input opt-in is off |
 | `input_permission_required` | broker, Host | FruitctlHost may not post events; it lacks the Accessibility grant |
