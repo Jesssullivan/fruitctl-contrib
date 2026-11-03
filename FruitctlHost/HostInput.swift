@@ -451,6 +451,13 @@ struct HostInputProcess: Equatable {
     /// The code signing identifier, set only when the running code is valid
     /// and Apple-anchored (`anchor apple`).
     var appleCodeIdentifier: String? = nil
+    /// The running executable's path (`proc_pidpath`).
+    var executablePath: String? = nil
+    /// False for a process that is not a regular application with a Dock
+    /// icon and menu bar; nil when unknown.
+    var regularApplication: Bool? = nil
+    /// The frontmost application's bundle directory.
+    var bundlePath: String? = nil
 }
 
 /// Processes that draw an Audio Unit's view for a host application (#172).
@@ -462,11 +469,17 @@ enum HostPluginHosting {
     static let auHostingServices: Set<String> = ["com.apple.audio.AUHostingService.arm64e",
                                                  "com.apple.audio.AUHostingService.x86-64"]
 
-    /// An Apple-signed AU hosting service, or a child process of the target.
-    static func serves(_ process: HostInputProcess, target: pid_t) -> Bool {
-        guard process.processID != target, process.processID > 0 else { return false }
-        return process.appleCodeIdentifier.map(auHostingServices.contains) == true
-            || process.parentProcessID == target
+    /// An Apple-signed AU hosting service, or a helper of the target: a
+    /// child process that is not a regular application and runs an
+    /// executable inside the target's own bundle.
+    static func serves(_ process: HostInputProcess, target: HostInputProcess) -> Bool {
+        guard process.processID != target.processID, process.processID > 0 else { return false }
+        if process.appleCodeIdentifier.map(auHostingServices.contains) == true { return true }
+        guard process.parentProcessID == target.processID, process.regularApplication == false,
+              let bundle = target.bundlePath, bundle.hasPrefix("/"), bundle.count > 1,
+              let path = process.executablePath else { return false }
+        let root = bundle.hasSuffix("/") ? bundle : bundle + "/"
+        return path.hasPrefix(root) && !path.contains("/../")
     }
 }
 
@@ -499,11 +512,25 @@ enum HostProcessIdentity {
         return values[kSecCodeInfoIdentifier as String] as? String
     }
 
+    static func executablePath(_ pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    /// The Window Server, by its Apple-anchored signing identifier rather
+    /// than the owner name any application can claim.
+    static let windowServerIdentifier = "com.apple.WindowServer"
+
     /// A process with the plug-in host fields filled in.
     static func describe(_ process: HostInputProcess) -> HostInputProcess {
         var described = process
         described.parentProcessID = parentProcessID(process.processID)
         described.appleCodeIdentifier = appleCodeIdentifier(process.processID)
+        described.executablePath = executablePath(process.processID)
+        described.regularApplication = NSRunningApplication(processIdentifier: process.processID)
+            .map { $0.activationPolicy == .regular }
         return described
     }
 }
@@ -539,32 +566,46 @@ struct HostWindowInfo: Equatable {
 /// Which window receives a pointer event at a point (#172).
 enum HostInputWindowList {
     static let cursorLayer = Int(CGWindowLevelForKey(.cursorWindow))
+    /// A cursor image is at most 256 by 256 points.
+    static let maximumCursorExtent: CGFloat = 256
 
     /// The Window Server draws a software cursor as an unnamed window at the
     /// cursor level around the pointer. It never receives events, and once
     /// the pointer arrives it is the topmost window there. The screen
-    /// recording indicator shares the level but has a name.
-    static func isSoftwareCursor(_ window: HostWindowInfo, pointer: CGPoint?) -> Bool {
-        guard window.ownerName == HostInputGate.windowServer, window.layer == cursorLayer,
-              (window.name ?? "").isEmpty, let pointer else { return false }
-        return window.bounds.contains(pointer)
+    /// recording indicator shares the level but has a name, so names must
+    /// be readable (Screen Recording) for any window to be looked through.
+    static func isSoftwareCursor(_ window: HostWindowInfo, pointer: CGPoint?, namesReadable: Bool,
+                                 isWindowServer: (pid_t) -> Bool) -> Bool {
+        guard namesReadable, window.ownerName == HostInputGate.windowServer, window.layer == cursorLayer,
+              (window.name ?? "").isEmpty, window.bounds.width <= maximumCursorExtent,
+              window.bounds.height <= maximumCursorExtent, let pointer, window.bounds.contains(pointer) else {
+            return false
+        }
+        return isWindowServer(window.processID)
     }
 
-    /// The topmost window under `point` that can take the event, and the
-    /// next one beneath it. `windows` is front to back. The Host's own
-    /// click-through indicator panels and the software cursor are looked
-    /// through; the Host's status item and menu are not.
+    /// The topmost window under `point` that can take the event, and its
+    /// parent: the window directly below it in front-to-back order, when
+    /// that one is at the same layer and contains it. A remote view such as
+    /// an out-of-process AU view is ordered just above its host's window.
+    /// The Host's own click-through indicator panels and the software cursor
+    /// are looked through; the Host's status item and menu are not.
     static func under(_ point: CGPoint, in windows: [HostWindowInfo], pointer: CGPoint?, ownProcess: pid_t,
-                      ownPanels: Set<Int>) -> (top: HostWindowInfo?, beneath: HostWindowInfo?) {
-        var found: [HostWindowInfo] = []
-        for window in windows {
-            guard window.bounds.contains(point), window.alpha > 0,
-                  !(window.processID == ownProcess && ownPanels.contains(window.number)),
-                  !isSoftwareCursor(window, pointer: pointer) else { continue }
-            found.append(window)
-            if found.count == 2 { break }
+                      ownPanels: Set<Int>, namesReadable: Bool,
+                      isWindowServer: (pid_t) -> Bool) -> (top: HostWindowInfo?, parent: HostWindowInfo?) {
+        func transparent(_ window: HostWindowInfo) -> Bool {
+            window.alpha <= 0 || (window.processID == ownProcess && ownPanels.contains(window.number))
+                || isSoftwareCursor(window, pointer: pointer, namesReadable: namesReadable,
+                                    isWindowServer: isWindowServer)
         }
-        return (found.first, found.count > 1 ? found[1] : nil)
+        guard let index = windows.firstIndex(where: { $0.bounds.contains(point) && !transparent($0) }) else {
+            return (nil, nil)
+        }
+        let top = windows[index]
+        let next = windows[(index + 1)...].first { !transparent($0) }
+        guard let next, next.layer == top.layer,
+              next.bounds.insetBy(dx: -1, dy: -1).contains(top.bounds) else { return (top, nil) }
+        return (top, next)
     }
 }
 
@@ -578,8 +619,11 @@ struct HostInputEnvironment: Equatable {
     var windowOwner: HostInputProcess?
     var windowOwnerName: String?
     var windowLayer: Int?
-    /// The owner of the next window beneath it at the same point (#172).
-    var windowBeneathOwnerPID: pid_t?
+    /// The Window Server, verified by its signature, owns that window.
+    var windowOwnerIsWindowServer = false
+    /// The owner of the window directly below it that contains it at the
+    /// same layer (#172); nil when there is none.
+    var windowParentOwnerPID: pid_t?
     /// The focused element's owner and whether it is a secure text field.
     var focusOwner: HostInputProcess?
     var focusSecure: Bool = false
@@ -651,11 +695,12 @@ enum HostInputGate {
         }
         if pointerCheck {
             guard let owner = environment.windowOwner else { throw HostInputError.windowMismatch }
-            let menuBar = environment.windowOwnerName == windowServer && environment.windowLayer == menuBarLayer
-            // An AU view drawn out of process sits directly over the
-            // target's own plug-in window (#172).
-            let pluginView = HostPluginHosting.serves(owner, target: frontmost.processID)
-                && environment.windowBeneathOwnerPID == frontmost.processID
+            let menuBar = environment.windowOwnerIsWindowServer && environment.windowOwnerName == windowServer
+                && environment.windowLayer == menuBarLayer
+            // An AU view drawn out of process is ordered directly over, and
+            // inside, the target's own plug-in window (#172).
+            let pluginView = HostPluginHosting.serves(owner, target: frontmost)
+                && environment.windowParentOwnerPID == frontmost.processID
             let acting = owner.processID == frontmost.processID
                 || owner.bundleID.map(panelServices.contains) == true || menuBar || pluginView
             guard acting else { throw HostInputError.windowMismatch }
@@ -1056,13 +1101,22 @@ enum HostSystemInputEnvironment {
         var environment = HostInputEnvironment(secureInput: IsSecureEventInputEnabled())
         if let front = NSWorkspace.shared.frontmostApplication {
             environment.frontmost = HostInputProcess(processID: front.processIdentifier,
-                bundleID: front.bundleIdentifier, executable: executable(front.processIdentifier))
+                bundleID: front.bundleIdentifier, executable: executable(front.processIdentifier),
+                bundlePath: front.bundleURL?.path)
         }
         if let point, let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                                  kCGNullWindowID) as? [[String: Any]] {
             let pointer = CGEvent(source: nil)?.location
-            let (top, beneath) = HostInputWindowList.under(point, in: windows.compactMap { HostWindowInfo($0) },
-                pointer: pointer, ownProcess: getpid(), ownPanels: ownPanels)
+            var verified: [pid_t: Bool] = [:]
+            let isWindowServer: (pid_t) -> Bool = { pid in
+                if let known = verified[pid] { return known }
+                let result = HostProcessIdentity.appleCodeIdentifier(pid) == HostProcessIdentity.windowServerIdentifier
+                verified[pid] = result
+                return result
+            }
+            let (top, parent) = HostInputWindowList.under(point, in: windows.compactMap { HostWindowInfo($0) },
+                pointer: pointer, ownProcess: getpid(), ownPanels: ownPanels,
+                namesReadable: CGPreflightScreenCaptureAccess(), isWindowServer: isWindowServer)
             if let top {
                 var owner = process(top.processID)
                 // Only another process's window needs the plug-in host reads.
@@ -1070,7 +1124,9 @@ enum HostSystemInputEnvironment {
                 environment.windowOwner = owner
                 environment.windowOwnerName = top.ownerName
                 environment.windowLayer = top.layer
-                environment.windowBeneathOwnerPID = beneath?.processID
+                environment.windowOwnerIsWindowServer = top.ownerName == HostInputGate.windowServer
+                    && isWindowServer(top.processID)
+                environment.windowParentOwnerPID = parent?.processID
             }
             if environment.windowOwnerName == HostInputGate.windowServer, let front = environment.frontmost,
                let bar = element(AXUIElementCreateApplication(front.processID), kAXMenuBarAttribute),

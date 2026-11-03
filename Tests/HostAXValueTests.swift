@@ -2,7 +2,9 @@ import CoreGraphics
 import XCTest
 
 /// Pure checks of ax_value (#161): parsing, the gate, value typing and
-/// readback. No Accessibility call reaches the desktop.
+/// readback, and the step runner over a fake node. No Accessibility call
+/// reaches the desktop.
+@MainActor
 final class HostAXValueTests: XCTestCase {
     private let target: HostValue = .object(["bundle_id": .string("com.apple.logic10")])
 
@@ -13,7 +15,8 @@ final class HostAXValueTests: XCTestCase {
 
     private func environment(front: pid_t = 64374, bundle: String = "com.apple.logic10") -> HostInputEnvironment {
         var value = HostInputEnvironment(secureInput: false)
-        value.frontmost = HostInputProcess(processID: front, bundleID: bundle, executable: "Logic Pro")
+        value.frontmost = HostInputProcess(processID: front, bundleID: bundle, executable: "Logic Pro",
+                                           bundlePath: "/Applications/Logic Pro.app")
         value.operatorInputAge = 5_000
         return value
     }
@@ -100,7 +103,12 @@ final class HostAXValueTests: XCTestCase {
         XCTAssertEqual(try check(service), .auHostingService)
         var child = HostInputProcess(processID: 700, bundleID: nil, executable: "PluginHost")
         child.parentProcessID = 64374
+        child.regularApplication = false
+        child.executablePath = "/Applications/Logic Pro.app/Contents/MacOS/PluginHost"
         XCTAssertEqual(try check(child), .targetChild)
+        var shell = child
+        shell.executablePath = "/bin/zsh"
+        refused("input_target_mismatch") { try check(shell) }
         var unrelated = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
         unrelated.parentProcessID = 1
         refused("input_target_mismatch") { try check(unrelated) }
@@ -117,10 +125,10 @@ final class HostAXValueTests: XCTestCase {
         var secure = environment()
         secure.secureInput = true
         refused("secure_input_active") { try check(logic, environment: secure) }
-        var password = slider()
-        password.role = "AXTextField"
-        password.subrole = "AXSecureTextField"
-        refused("secure_input_active") { try check(logic, state: password) }
+        var secureField = slider()
+        secureField.role = "AXTextField"
+        secureField.subrole = "AXSecureTextField"
+        refused("secure_input_active") { try check(logic, state: secureField) }
         var button = slider()
         button.role = "AXButton"
         refused("ax_action_unsupported") { try check(logic, state: button) }
@@ -141,6 +149,9 @@ final class HostAXValueTests: XCTestCase {
         var busy = environment()
         busy.operatorInputAge = 200
         refused("operator_input_detected") { try check(logic, environment: busy) }
+        var timesOnly = environment()
+        timesOnly.monitorMode = "event_times"
+        refused("operator_input_monitor_unavailable") { try check(logic, environment: timesOnly) }
         let asserting = try request(["operation": .string("set"), "value": .integer(40),
                                      "operator_input": .string("assert")])
         XCTAssertEqual(try check(logic, environment: busy, input: asserting), .target)
@@ -209,5 +220,136 @@ final class HostAXValueTests: XCTestCase {
         XCTAssertEqual(PressOnly().setValue(.number(1)), .unsupported)
         XCTAssertEqual(HostAXOperation.increment.path, "ax_increment")
         XCTAssertEqual(HostAXOperation.decrement.rawValue, "AXDecrement")
+    }
+
+    // MARK: Step runner
+
+    private final class ValueNode: HostAXNode {
+        var values: [String]
+        var sets: [HostAXValueInput] = []
+        var performed: [HostAXOperation] = []
+        var result: HostAXPerformResult = .performed
+        init(_ value: String) { values = [value] }
+        func attributes() -> HostAXAttributes { HostAXAttributes() }
+        func children(limit: Int) -> [HostAXNode] { [] }
+        func liveState() -> HostAXLiveRead {
+            var state = HostAXLiveState()
+            state.role = "AXSlider"; state.value = values.last; state.valueSettable = true; state.enabled = true
+            state.actions = ["AXIncrement", "AXDecrement"]; state.ownerProcessID = 64374
+            return .live(state)
+        }
+        func perform(_ operation: HostAXOperation) -> HostAXPerformResult {
+            performed.append(operation)
+            if result != .unsupported, let last = values.last, let number = Int(last) {
+                values.append(String(number + (operation == .increment ? 1 : -1)))
+            }
+            return result
+        }
+        func setValue(_ value: HostAXValueInput) -> HostAXPerformResult {
+            sets.append(value)
+            if result != .unsupported, case .number(let number) = value { values.append(HostAXValueInput.format(number)) }
+            return result
+        }
+    }
+
+    private func runner(_ request: HostAXValueRequest, _ node: ValueNode, lease: @escaping () throws -> Void = {},
+                        environment: @escaping () -> HostInputEnvironment = { HostAXValueTests.idle() },
+                        clock: @escaping () -> UInt64 = { 1_000 }, verified: Bool? = nil) -> HostAXValueRunner {
+        HostAXValueRunner(request: request, node: node, snapshotProcessID: 64374, lease: lease,
+            environment: environment,
+            describe: { pid in pid.map { HostInputProcess(processID: $0, bundleID: "com.apple.logic10",
+                                                          executable: "Logic Pro") } },
+            now: clock, liveState: { node.liveState() },
+            verify: { previous, _ in
+                let last = node.liveState()
+                return (verified ?? HostAXValueVerifier.satisfied(request.operation, requested: request.value,
+                                                                  before: previous, after: last), last)
+            })
+    }
+
+    private static func idle() -> HostInputEnvironment {
+        var value = HostInputEnvironment(secureInput: false)
+        value.frontmost = HostInputProcess(processID: 64374, bundleID: "com.apple.logic10", executable: "Logic Pro")
+        value.operatorInputAge = 5_000
+        return value
+    }
+
+    func testASetRunsOneCallAndReadsTheValueBack() async throws {
+        let node = ValueNode("18")
+        let outcome = try await runner(try request(["operation": .string("set"), "value": .integer(40)]), node).run()
+        XCTAssertEqual(node.sets, [.number(40)])
+        XCTAssertEqual([outcome.before, outcome.after], ["18", "40"])
+        XCTAssertEqual(outcome.performed, 1)
+        XCTAssertTrue(outcome.verified)
+        XCTAssertNil(outcome.stopReason)
+        XCTAssertEqual(outcome.owner, .target)
+    }
+
+    func testStepsStopOnLeaseLossOperatorInputBudgetAndUncertainty() async throws {
+        let up = try request(["operation": .string("increment"), "steps": .integer(5)])
+        var node = ValueNode("18")
+        var calls = 0
+        var outcome = try await runner(up, node, lease: {
+            calls += 1
+            if calls == 3 { throw HostLeaseError.expired }
+        }).run()
+        XCTAssertEqual(outcome.performed, 2)
+        XCTAssertEqual(outcome.stopReason, "lease_lost")
+        XCTAssertTrue(outcome.leaseLost)
+        XCTAssertEqual(outcome.after, "20")
+
+        node = ValueNode("18")
+        var reads = 0
+        outcome = try await runner(up, node, environment: {
+            reads += 1
+            var value = HostAXValueTests.idle()
+            if reads > 1 { value.operatorInputAge = 0 }
+            return value
+        }, clock: { 1_000 + UInt64(reads) * 10 }).run()
+        XCTAssertEqual(outcome.performed, 1)
+        XCTAssertEqual(outcome.stopReason, "operator_input_detected")
+        XCTAssertFalse(outcome.leaseLost)
+
+        node = ValueNode("18")
+        var time: UInt64 = 1_000
+        outcome = try await runner(up, node, clock: { time += 900; return time }).run()
+        XCTAssertEqual(outcome.stopReason, "budget_exhausted")
+        XCTAssertLessThan(outcome.performed, 5)
+
+        node = ValueNode("18")
+        node.result = .indeterminate
+        outcome = try await runner(up, node).run()
+        XCTAssertEqual(outcome.performed, 1)
+        XCTAssertEqual(outcome.stopReason, "ax_indeterminate")
+
+        node = ValueNode("18")
+        outcome = try await runner(up, node, verified: false).run()
+        XCTAssertEqual(outcome.performed, 1)
+        XCTAssertEqual(outcome.stopReason, "value_unverified")
+        XCTAssertFalse(outcome.verified)
+    }
+
+    func testRefusalsBeforeTheFirstCallThrowAndActOnNothing() async throws {
+        let set = try request(["operation": .string("set"), "value": .integer(40)])
+        let node = ValueNode("18")
+        node.result = .unsupported
+        do { _ = try await runner(set, node).run(); XCTFail("expected a refusal") } catch {
+            XCTAssertEqual(error as? HostAXActionError, .unsupported)
+        }
+        let quiet = ValueNode("18")
+        do {
+            _ = try await runner(set, quiet, lease: { throw HostInputError.disabled }).run()
+            XCTFail("expected a refusal")
+        } catch { XCTAssertEqual(error as? HostInputError, .disabled) }
+        XCTAssertTrue(quiet.sets.isEmpty)
+        do {
+            _ = try await runner(set, quiet, environment: {
+                var value = HostAXValueTests.idle()
+                value.secureInput = true
+                return value
+            }).run()
+            XCTFail("expected a refusal")
+        } catch { XCTAssertEqual(error as? HostInputError, .secureInput) }
+        XCTAssertTrue(quiet.sets.isEmpty)
     }
 }

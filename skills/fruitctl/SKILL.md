@@ -128,8 +128,11 @@ To change a slider, text field, stepper or combo box, prefer
 reports: a Logic plug-in slider holds a raw integer, such as 18 for a ratio
 shown as 2.1:1. `step_element {ref, steps}` performs `AXIncrement` for positive
 steps and `AXDecrement` for negative ones, up to 10. Read `value_after` and
-`verified` in the result. When `verified` is false the control did not take the
-value; take a new `ax_snapshot` before trying anything else.
+`verified` in the result. A stop is `input_interrupted` with the calls that ran.
+`verified: false` does not mean nothing happened: the control may have moved,
+to a rounded value for example, or may still act later. Never repeat the call
+to get `verified: true`. Take a new `ax_snapshot` and compare `value_after`
+first.
 
 ## Computer-use alias
 

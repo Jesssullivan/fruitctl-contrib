@@ -15,7 +15,8 @@ enum HostAXValueInput: Equatable {
         switch self {
         case .number(let number):
             guard number.isFinite else { return nil }
-            return numeric ? Self.cfNumber(number) : Self.format(number) as CFString
+            if numeric { return Self.cfNumber(number) }
+            return Self.format(number) as CFString
         case .text(let text):
             guard numeric else { return text as CFString }
             guard let number = Double(text.trimmingCharacters(in: .whitespaces)), number.isFinite else { return nil }
@@ -127,7 +128,8 @@ enum HostAXValueOwner: String {
     case target
     /// An Apple-signed AudioToolbox AU hosting service (#172).
     case auHostingService = "au_hosting_service"
-    /// A child process of the target application.
+    /// A helper of the target: a child process, not a regular application,
+    /// running an executable inside the target's bundle.
     case targetChild = "target_child"
 }
 
@@ -149,13 +151,14 @@ enum HostAXValueGate {
               request.target.processID.map({ $0 == frontmost.processID }) ?? true,
               snapshotProcessID == frontmost.processID else { throw HostInputError.targetMismatch }
         guard let owner else { throw HostAXActionError.unreachable }
+        // The ref came from the target's own snapshot, so an element owned
+        // by another process is a remote view inside the target's tree.
         let kind: HostAXValueOwner
         if owner.processID == frontmost.processID {
             kind = .target
-        } else if owner.appleCodeIdentifier.map(HostPluginHosting.auHostingServices.contains) == true {
-            kind = .auHostingService
-        } else if owner.parentProcessID == frontmost.processID {
-            kind = .targetChild
+        } else if HostPluginHosting.serves(owner, target: frontmost) {
+            kind = owner.appleCodeIdentifier.map(HostPluginHosting.auHostingServices.contains) == true
+                ? .auHostingService : .targetChild
         } else {
             throw HostInputError.targetMismatch
         }
@@ -172,19 +175,24 @@ enum HostAXValueGate {
                 throw HostAXActionError.unsupported
             }
         }
-        if start, request.policy == .yield, let age = environment.operatorInputAge,
-           age < request.operatorIdleMilliseconds {
-            throw HostInputError.operatorInput
+        if start, request.policy == .yield {
+            // Times alone cannot tell the operator from other posters.
+            if environment.monitorMode == "event_times" { throw HostInputError.monitorUnavailable }
+            if let age = environment.operatorInputAge, age < request.operatorIdleMilliseconds {
+                throw HostInputError.operatorInput
+            }
         }
         return kind
     }
 }
 
 enum HostAXValueVerifier {
-    /// One set has 250 ms to read back; each step has 120 ms, so ten steps
-    /// stay inside the broker's 2.4 s round trip.
+    /// One set has 250 ms to read back; each step has 120 ms. No step
+    /// starts after `actionBudgetMilliseconds`, so the reply stays inside
+    /// the broker's 2.4 s round trip.
     static let setBudgetNanoseconds: UInt64 = 250_000_000
     static let stepBudgetNanoseconds: UInt64 = 120_000_000
+    static let actionBudgetMilliseconds: UInt64 = 1_600
 
     /// set: the element reads the requested value. A step: the value changed,
     /// and a numeric value moved the way that was asked.
@@ -225,6 +233,8 @@ struct HostAXValueOutcome {
     var verified = false
     var axResult: HostAXPerformResult?
     var stopReason: String?
+    /// The lease ended after an AX call; the controller retires its lane.
+    var leaseLost = false
 
     var metadata: [String: HostValue] {
         func text(_ value: String?) -> HostValue { value.map { .string(HostAccessibilitySnapshot.bounded($0)) } ?? .null }
@@ -239,5 +249,101 @@ struct HostAXValueOutcome {
         if let axResult { result["ax_result"] = .string(axResult == .performed ? "performed" : "indeterminate") }
         if let stopReason { result["stop_reason"] = .string(stopReason) }
         return result
+    }
+}
+
+/// Runs one ax_value request against a node. Throws only before the first AX
+/// call that could change the element; afterwards every stop is reported in
+/// the outcome with the steps that ran. Nothing is retried.
+@MainActor
+struct HostAXValueRunner {
+    let request: HostAXValueRequest
+    let node: HostAXNode
+    let snapshotProcessID: pid_t
+    /// Lease, Stop, opt-in, connection and the local menu.
+    let lease: @MainActor () throws -> Void
+    let environment: @MainActor () -> HostInputEnvironment
+    let describe: @MainActor (pid_t?) -> HostInputProcess?
+    /// Milliseconds on a monotonic clock.
+    let now: @MainActor () -> UInt64
+    let liveState: @MainActor () async -> HostAXLiveRead
+    /// Polls the element after one call within the budget.
+    let verify: @MainActor (_ previous: String?, _ budgetNanoseconds: UInt64) async
+        -> (verified: Bool, last: HostAXLiveRead)
+
+    func run() async throws -> HostAXValueOutcome {
+        let state: HostAXLiveState
+        switch await liveState() {
+        case .invalid: throw HostAXActionError.staleRef
+        case .unresponsive: throw HostAXActionError.unreachable
+        case .live(let live): state = live
+        }
+        let owner = try HostAXValueGate.check(request, environment: environment(), snapshotProcessID: snapshotProcessID,
+                                              owner: describe(state.ownerProcessID), state: state, start: true)
+        var current = state
+        var outcome = HostAXValueOutcome(request: request, owner: owner, role: state.role, before: state.value)
+        outcome.after = state.value
+        let started = now()
+        let count = request.operation == .set ? 1 : request.steps
+        for index in 0..<count {
+            if index == 0 {
+                try lease()
+            } else {
+                if now() - started >= HostAXValueVerifier.actionBudgetMilliseconds {
+                    outcome.stopReason = "budget_exhausted"; break
+                }
+                do {
+                    try lease()
+                    let read = environment()
+                    _ = try HostAXValueGate.check(request, environment: read, snapshotProcessID: snapshotProcessID,
+                                                  owner: describe(current.ownerProcessID), state: current, start: false)
+                    if request.policy == .yield, let age = read.operatorInputAge, age < now() - started {
+                        throw HostInputError.operatorInput
+                    }
+                } catch let error as HostInputError {
+                    outcome.stopReason = error.rawValue; break
+                } catch let error as HostAXActionError {
+                    outcome.stopReason = error.rawValue; break
+                } catch {
+                    outcome.stopReason = "lease_lost"; outcome.leaseLost = true; break
+                }
+            }
+            let result: HostAXPerformResult
+            if let operation = request.operation.axOperation {
+                result = node.perform(operation)
+            } else if let value = request.value {
+                result = node.setValue(value)
+            } else {
+                result = .unsupported
+            }
+            switch result {
+            case .invalid:
+                if index == 0 { throw HostAXActionError.staleRef }
+                outcome.stopReason = HostAXActionError.staleRef.rawValue
+            case .permissionRequired:
+                if index == 0 { throw HostAccessibilityError.permissionRequired }
+                outcome.stopReason = HostAccessibilityError.permissionRequired.rawValue
+            case .unsupported:
+                // The element refused before acting.
+                if index == 0 { throw HostAXActionError.unsupported }
+                outcome.stopReason = HostAXActionError.unsupported.rawValue
+            case .performed, .indeterminate:
+                break
+            }
+            if outcome.stopReason != nil { break }
+            outcome.performed += 1
+            outcome.axResult = result
+            let budget = request.operation == .set ? HostAXValueVerifier.setBudgetNanoseconds
+                : HostAXValueVerifier.stepBudgetNanoseconds
+            let read = await verify(current.value, budget)
+            outcome.verified = read.verified
+            if case .live(let live) = read.last { current = live; outcome.after = live.value }
+            // A step that moved nothing is at its limit or was ignored.
+            if !read.verified { outcome.stopReason = "value_unverified"; break }
+            // A call that may still act later ends the action (AGENTS.md:
+            // cancel uncertain input; never replay it).
+            if result == .indeterminate, index < count - 1 { outcome.stopReason = "ax_indeterminate"; break }
+        }
+        return outcome
     }
 }

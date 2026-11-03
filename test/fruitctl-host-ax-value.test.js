@@ -16,7 +16,7 @@ function valueHost({ health = {}, answer, capabilities = ['input', 'capture_scop
     operator_input_monitor: 'event_tap', ...health }, alter(request, response) {
     if (request.action !== 'ax_value' || !response.success) return response;
     const custom = answer?.(request);
-    if (custom && custom.success === false) return custom;
+    if (custom && (custom.success === false || custom.result?.lease_lost)) return custom;
     const { params } = request;
     const steps = params.operation === 'set' ? 1 : params.steps;
     response.result.ax_value = { ref: params.ref, generation: params.generation, operation: params.operation,
@@ -73,7 +73,9 @@ test('set_element_value and step_element send one ax_value request and report th
     assert.equal(set.result.ax_value.value_after, '40');
     assert.equal(set.result.ax_value.verified, true);
     assert.equal(set.result.ax_value.owner, 'target');
-    assert.match(set.result.detail, /"18" -> "40", verified true/);
+    assert.equal(set.result.detail, `set_element_value ${REF}: 1 AX calls, verified true`);
+    // The journalled detail carries no value.
+    assert.doesNotMatch(set.result.detail, /40|18/);
     const [down] = await executor.execute([{ action: 'step_element', ref: REF, steps: -3, app: LOGIC }]);
     const second = sent(host)[1];
     assert.deepEqual([second.operation, second.steps, second.value], ['decrement', 3, undefined]);
@@ -124,7 +126,8 @@ test('a Host refusal is a per-call error that keeps the lane', async () => {
   try {
     await executor.execute([{ action: 'ax_snapshot' }]);
     for (const reason of ['input_target_mismatch', 'ax_action_unsupported', 'secure_input_active',
-      'operator_input_detected', 'human_consent_required']) {
+      'operator_input_detected', 'operator_input_monitor_unavailable', 'stale_ref', 'ax_unreachable',
+      'human_consent_required']) {
       code = reason;
       const responses = await executor.execute([{ action: 'set_element_value', ref: REF, value: 4 },
         { action: 'screenshot' }]);
@@ -149,16 +152,22 @@ test('a step stopped part way names what ran; an unverified value is a result', 
     assert.equal(stopped.error.data.reason, 'operator_input_detected');
     assert.equal(stopped.error.data.steps_performed, 2);
     assert.equal(executor.failed, undefined);
+    // An unverified value may still have acted: it ends the batch.
     custom = { value_after: '18', verified: false, stop_reason: 'value_unverified' };
-    const [unverified] = await executor.execute([{ action: 'set_element_value', ref: REF, value: 40 }]);
-    assert.equal(unverified.result.ax_value.verified, false);
-    assert.equal(unverified.result.ax_value.value_after, '18');
+    const responses = await executor.execute([{ action: 'set_element_value', ref: REF, value: 40 },
+      { action: 'screenshot' }]);
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0].error.data.reason, 'value_unverified');
+    assert.equal(responses[0].error.data.verified, false);
+    assert.equal(responses[0].error.data.value_after, '18');
+    assert.equal(executor.failed, undefined);
   } finally { await executor.close(); }
 });
 
 test('a receipt for another ref or owner retires the executor', async () => {
   for (const custom of [{ ref: 'ax:77:0' }, { owner: 'cmux' }, { steps_performed: 3 }, { target_bundle_id: 'x' },
-    { steps_performed: 0 }]) {
+    { steps_performed: 0 }, { verified: false }, { verified: true, stop_reason: 'value_unverified' },
+    { steps: 2 }]) {
     const { executor } = await executorFor({ answer: () => custom });
     try {
       await executor.execute([{ action: 'ax_snapshot' }]);
@@ -181,4 +190,16 @@ test('the MCP schema takes value and steps only on their own actions', () => {
     /element ref/);
   assert.throws(() => validateActionParameters({ action: 'set_element_value', ref: REF, value: 1, window: 'x' }),
     /window applies/);
+});
+
+test('a lease lost after an AX call retires the lane with the count', async () => {
+  const { executor } = await executorFor({ answer: request => ({ success: true, id: request.id,
+    result: { instance_id: 'resident-test-app', session_id: request.params.session_id, lease_lost: true,
+      ax_value: { steps_performed: 2 } } }) });
+  try {
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    await assert.rejects(executor.execute([{ action: 'step_element', ref: REF, steps: 4 }]),
+      /ax_value lease ended after 2 AX calls/);
+    assert.ok(executor.failed);
+  } finally { await executor.close(); }
 });

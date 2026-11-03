@@ -372,14 +372,30 @@ struct HostSystemAXNode: HostAXNode, @unchecked Sendable {
         }
     }
 
+    /// Reads before it sets; a failed read sets nothing and is reported as
+    /// unsupported. A numeric value outside the element's reported AXMinValue
+    /// and AXMaxValue is not sent.
     func setValue(_ input: HostAXValueInput) -> HostAXPerformResult {
         var current: AnyObject?
         let status = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &current)
         if status == .invalidUIElement { return .invalid }
-        guard status == .success || status == .noValue else { return HostAXPerformResult(status) }
+        guard status == .success || status == .noValue else { return .unsupported }
         let numeric = current.map { CFGetTypeID($0) == CFNumberGetTypeID() } ?? false
+        // Text goes only to an element whose value is text or empty.
+        if !numeric, let current, CFGetTypeID(current) != CFStringGetTypeID() { return .unsupported }
         guard let value = input.axValue(numeric: numeric) else { return .unsupported }
+        if numeric, let requested = (value as? NSNumber)?.doubleValue {
+            if let minimum = numericAttribute(kAXMinValueAttribute), requested < minimum { return .unsupported }
+            if let maximum = numericAttribute(kAXMaxValueAttribute), requested > maximum { return .unsupported }
+        }
         return HostAXPerformResult(AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value))
+    }
+
+    private func numericAttribute(_ attribute: String) -> Double? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value,
+              CFGetTypeID(value) == CFNumberGetTypeID() else { return nil }
+        return (value as? NSNumber)?.doubleValue
     }
 
     private static func boolean(_ value: AnyObject) -> Bool? {

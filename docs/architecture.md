@@ -440,11 +440,20 @@ on this route.
 | `activate_app` waits for 2 s of operator idle under either policy | Host | `operator_input_detected` |
 
 The window check looks through the Host's click-through indicator panels and the
-Window Server's software cursor. That cursor is an unnamed window at the cursor
-level, around the pointer. Once the pointer reaches the point, it is the topmost
-window there and receives no events (#172). An AU hosting process is an
-Apple-anchored `com.apple.audio.AUHostingService.arm64e` or `.x86-64`, or a
-child process of the target.
+Window Server's software cursor (#172). That cursor is an unnamed window at the
+cursor level, at most 256 by 256 points, around the pointer. Once the pointer
+reaches the point, it is the topmost window there and receives no events. The
+owner must be the Window Server by its Apple-anchored signing identifier
+`com.apple.WindowServer`, not by name, and window names must be readable
+through the Screen Recording grant. The menu bar is identified the same way.
+
+An AU hosting process is an Apple-anchored
+`com.apple.audio.AUHostingService.arm64e` or `.x86-64`, or a helper of the
+target: a child process that is not a regular application and runs an
+executable inside the target's bundle. Its window acts for the target only when
+the window directly below it in front-to-back order is the target's, at the
+same layer, and contains it. A remote view is ordered that way over its host's
+window. Logic's main window, at another layer, does not qualify.
 
 A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
@@ -467,7 +476,6 @@ cannot tell operator keys from the Host's own during typing, so `yield` refuses
 key and text input without the keyboard tap. Qualification of the tap, timing and
 Space behaviour on a live desktop is an attended gate.
 
-
 ### Element values
 
 `set_element_value {ref, value, app?}` sets one element's `AXValue`, and
@@ -476,14 +484,26 @@ Space behaviour on a live desktop is an attended gate.
 lease, secure-input check, frontmost target and `yield` idle time as posted
 input. The element must be an `AXSlider`, `AXTextField`, `AXIncrementor` or
 `AXComboBox` that is enabled, with a settable value or the step action. Its
-owner must be the target or the target's AU hosting process. The Host sets a
+owner must be the target, or the target's AU hosting process reached through
+the target's own snapshot. The Host sets a
 number for an element whose value is a number, and text otherwise. It then
 reads the value back within 250 milliseconds for a set and 120 milliseconds
 for each step. The reply carries `value_before`, `value_after`, `owner`,
 `steps_performed` and `verified`. A refusal before the first AX call keeps the
-lease. A step that changes nothing ends with `verified: false`. Operator input,
-Stop or a target change between steps ends the action as `input_interrupted`
-with the steps that ran. Nothing is retried.
+lease. Under `yield` the Host refuses with `operator_input_monitor_unavailable`
+when only event times are available. After the first AX call, any stop ends
+the batch as `input_interrupted` with the calls that ran and the readback:
+
+- `value_unverified`: the value did not read back.
+- `ax_indeterminate`: a call may still act later.
+- `operator_input_detected`, Stop or a target change between steps.
+- `budget_exhausted`: no step starts after 1.6 seconds.
+
+`verified: false` can still mean the control changed, for example to a rounded
+value. Read `value_after` before acting again. When the lease itself ends after
+an AX call, the lane retires with the count. Nothing is retried. A numeric value
+outside the element's `AXMinValue` and `AXMaxValue` is not sent.
+
 ## Host capture scope
 
 Host captures leave out windows the agent should not see (#163). A Host-only

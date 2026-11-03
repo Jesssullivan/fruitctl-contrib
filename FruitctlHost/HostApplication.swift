@@ -1065,99 +1065,53 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         axActionInProgress = true
         defer { axActionInProgress = false }
         let node = target.node
-        let started = clock.milliseconds()
-        let readEnvironment: () -> HostInputEnvironment = { [unowned self] in
-            HostSystemInputEnvironment.read(point: nil, start: true, keyboard: false, wantsTitle: false,
-                executable: { self.accessibility.executableName(processID: $0) }, monitor: self.inputMonitor,
-                now: self.clock.milliseconds(), ownPanels: [])
-        }
-        let describe: (pid_t?) -> HostInputProcess? = { [unowned self] pid in
-            guard let pid else { return nil }
-            let process = HostInputProcess(processID: pid,
-                bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
-                executable: self.accessibility.executableName(processID: pid))
-            return pid == target.processID ? process : HostProcessIdentity.describe(process)
-        }
-        let leaseCheck: () throws -> Void = { [unowned self] in
-            _ = try self.requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
-                                        geometry: geometry)
-            guard self.inputPreferences.isEnabled else { throw HostInputError.disabled }
-            guard self.server?.connectionIsLive(connectionID) == true else { throw HostLeaseError.expired }
-            guard !self.humanMenuOpen else { throw HostInputError.operatorInput }
-        }
-        do {
-            let first = await Task.detached(priority: .userInitiated) { node.liveState() }.value
-            var state: HostAXLiveState
-            switch first {
-            case .invalid: throw HostAXActionError.staleRef
-            case .unresponsive: throw HostAXActionError.unreachable
-            case .live(let live): state = live
-            }
-            let owner = try HostAXValueGate.check(valueRequest, environment: readEnvironment(),
-                snapshotProcessID: target.processID, owner: describe(state.ownerProcessID), state: state, start: true)
-            var outcome = HostAXValueOutcome(request: valueRequest, owner: owner, role: state.role, before: state.value)
-            outcome.after = state.value
-            let count = valueRequest.operation == .set ? 1 : valueRequest.steps
-            steps: for index in 0..<count {
-                do {
-                    try leaseCheck()
-                    if index > 0 {
-                        // The element, focus and operator are read again
-                        // before every further step.
-                        let current = readEnvironment()
-                        _ = try HostAXValueGate.check(valueRequest, environment: current,
-                            snapshotProcessID: target.processID, owner: describe(state.ownerProcessID), state: state,
-                            start: false)
-                        if valueRequest.policy == .yield, let age = current.operatorInputAge,
-                           age < clock.milliseconds() - started {
-                            throw HostInputError.operatorInput
-                        }
-                    }
-                } catch let error as HostInputError where index > 0 {
-                    outcome.stopReason = error.rawValue; break steps
-                } catch let error as HostAXActionError where index > 0 {
-                    outcome.stopReason = error.rawValue; break steps
-                }
-                let result: HostAXPerformResult
-                if let operation = valueRequest.operation.axOperation {
-                    result = node.perform(operation)
-                } else {
-                    result = node.setValue(valueRequest.value!)
-                }
-                switch result {
-                case .invalid:
-                    if index == 0 { throw HostAXActionError.staleRef }
-                    outcome.stopReason = HostAXActionError.staleRef.rawValue; break steps
-                case .permissionRequired:
-                    if index == 0 { throw HostAccessibilityError.permissionRequired }
-                    outcome.stopReason = HostAccessibilityError.permissionRequired.rawValue; break steps
-                case .unsupported:
-                    // The element refused before acting.
-                    if index == 0 { throw HostAXActionError.unsupported }
-                    outcome.stopReason = HostAXActionError.unsupported.rawValue; break steps
-                case .performed, .indeterminate:
-                    break
-                }
-                outcome.performed += 1
-                outcome.axResult = result
-                let operation = valueRequest.operation
-                let requested = valueRequest.value
-                let previous = state.value
-                let budget = operation == .set ? HostAXValueVerifier.setBudgetNanoseconds
-                    : HostAXValueVerifier.stepBudgetNanoseconds
+        let runner = HostAXValueRunner(request: valueRequest, node: node, snapshotProcessID: target.processID,
+            lease: { [unowned self] in
+                _ = try self.requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                            geometry: geometry)
+                guard self.inputPreferences.isEnabled else { throw HostInputError.disabled }
+                guard self.server?.connectionIsLive(connectionID) == true else { throw HostLeaseError.expired }
+                guard !self.humanMenuOpen else { throw HostInputError.operatorInput }
+            },
+            environment: { [unowned self] in
+                HostSystemInputEnvironment.read(point: nil, start: true, keyboard: false, wantsTitle: false,
+                    executable: { self.accessibility.executableName(processID: $0) }, monitor: self.inputMonitor,
+                    now: self.clock.milliseconds(), ownPanels: [])
+            },
+            describe: { [unowned self] pid in
+                guard let pid else { return nil }
+                let process = HostInputProcess(processID: pid,
+                    bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+                    executable: self.accessibility.executableName(processID: pid))
+                return pid == target.processID ? process : HostProcessIdentity.describe(process)
+            },
+            now: { [clock] in clock.milliseconds() },
+            liveState: { await Task.detached(priority: .userInitiated) { node.liveState() }.value },
+            verify: { previous, budget in
+                let operation = valueRequest.operation, requested = valueRequest.value
                 let deadline = DispatchTime.now().uptimeNanoseconds + budget
-                let read = await Task.detached(priority: .userInitiated) {
+                return await Task.detached(priority: .userInitiated) {
                     HostAXValueVerifier.poll(operation, requested: requested, before: previous,
                         read: { node.liveState() }, expired: { DispatchTime.now().uptimeNanoseconds >= deadline },
                         pause: { usleep(useconds_t(HostAXActionPlanner.pollNanoseconds / 1_000)) })
                 }.value
-                outcome.verified = read.verified
-                if case .live(let live) = read.last { state = live; outcome.after = live.value }
-                // A step that moved nothing is at its limit or was ignored.
-                if !read.verified { outcome.stopReason = "value_unverified"; break steps }
+            })
+        do {
+            var outcome = try await runner.run()
+            var current: HostActivityLease?
+            if !outcome.leaseLost {
+                current = try? requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                              geometry: geometry)
             }
-            let current = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
-                                             geometry: geometry)
+            guard let current else {
+                // The lease ended after an AX call (Stop, expiry, display
+                // change). Report what ran; the controller retires its lane.
+                outcome.leaseLost = true
+                if outcome.stopReason == nil { outcome.stopReason = "lease_lost" }
+                if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+                return ["instance_id": .string(instanceID), "session_id": .string(session),
+                        "lease_lost": .boolean(true), "ax_value": .object(outcome.metadata)]
+            }
             return readiness(now: clock.milliseconds(), activity: current)
                 .merging(["ax_value": .object(outcome.metadata)]) { _, value in value }
         } catch let refusal as HostInputError {
