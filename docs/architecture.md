@@ -441,7 +441,7 @@ one point is up to the plug-in; check the readback frame. The VNC route refuses 
 | Live lease, fresh indicator heartbeat, unchanged display, no Stop | Host, before every event | the lease error ends the action |
 | `IsSecureEventInputEnabled`, or a focused secure text field | Host, before every event | `secure_input_active` |
 | Frontmost app is the target; optional pid and window title | Host, before every event | `input_target_mismatch` |
-| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. An AU hosting process for the target also qualifies when the target's own window lies directly beneath it (#172). The Host's own status item and menu are refused | Host | `input_window_mismatch` |
+| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. An AU hosting process for the target also qualifies when the target's own window lies directly beneath it (#172). A window in front of the one the system says a mouse-down would hit does not count (#186). The Host's own status item and menu are refused | Host | `input_window_mismatch` |
 | Key combinations macOS or the Dock handle: app and Space switching, Spotlight, input sources, force quit, lock, log out | Host | `input_system_shortcut` |
 | No pointer position, including every point of a drag, within 12 points of an active hot corner or within 4 points of the Dock's edge (#178). A corner is active when `com.apple.dock` `wvous-*-corner` is above 1 or unreadable; an absent bottom-right key is macOS's default Quick Note. The Dock's edge counts whether or not it hides, because a full-screen window reveals it | Host, before the first event | `input_screen_edge` |
 | Typing needs a readable focused text input of the target. A newline or tab ends its request. Focus held by the target's AU hosting process (an out-of-process plug-in view) admits keys, and admits typing of 1 to 16 digits, signs, points or commas into a field AX cannot read (#179). Those characters are also Logic key commands (screensets, transport), as with `key_tap`: click into the field first and check the readback frame | Host | `input_focus_unavailable` |
@@ -450,7 +450,15 @@ one point is up to the plug-in; check the readback frame. The VNC route refuses 
 | The local Fruitctl menu is open | Host, every event | the action stops |
 | `activate_app` waits for 2 s of operator idle under either policy | Host | `operator_input_detected` |
 
-The window check looks through the Host's click-through indicator panels and the
+The Host asks AppKit which window a mouse-down at the point would hit
+(`NSWindow.windowNumber(at:belowWindowWithWindowNumber:)`). Any window in front of
+that one does not take the click and is looked through (#186). On neo a full-screen
+Notification Center window stays at layer 21 while clicks reach Logic beneath it.
+A window the system does hit, such as an alert banner, still refuses, and the
+refusal names it. When AppKit gives no answer, or the window list does not show
+its answer at the point, the list alone decides.
+
+The window check also looks through the Host's click-through indicator panels and the
 Window Server's software cursor (#172). That cursor is an unnamed window at the
 cursor level, at most 256 by 256 points, around the pointer. Once the pointer
 reaches the point, it is the topmost window there and receives no events. The
@@ -464,7 +472,9 @@ target: a child process that is not a regular application and runs an
 executable inside the target's bundle. Its window acts for the target only when
 the window directly below it in front-to-back order is the target's, at the
 same layer, and contains it. A remote view is ordered that way over its host's
-window. Logic's main window, at another layer, does not qualify.
+window. Logic's main window, at another layer, does not qualify. Keyboard focus
+in an Apple AU hosting service counts by the same window rule (#185), because
+the service also hosts other applications' views.
 
 `input_window_mismatch` names the window that refused it (#182), as `window` in
 the refusal's data, and in `input_interrupted` when it stopped an action. It
@@ -610,6 +620,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
 | `invalid_input` | broker | A Host input action's coordinates, keys, text or scroll are invalid; nothing was sent |
 | `host_busy` | broker | After an idle release, another session holds the Host's lease; nothing was sent and the lane is kept |
+| `agent_idle_released` | Host | The Host ended the activity after 660 s with no agent request (#177). The lane retires; the next call begins a new one |
 | `input_target_not_allowed` | broker | The action's `app` is not one of the target's `hostInput.applications` |
 | `input_disabled` | broker, Host | The FruitctlHost menu's agent input opt-in is off |
 | `input_permission_required` | broker, Host | FruitctlHost may not post events; it lacks the Accessibility grant |

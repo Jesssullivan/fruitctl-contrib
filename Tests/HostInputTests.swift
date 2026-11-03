@@ -432,9 +432,90 @@ final class HostInputTests: XCTestCase {
     }
 
     private func pick(_ point: CGPoint, _ windows: [HostWindowInfo], pointer: CGPoint?, panels: Set<Int> = [5529],
-                      namesReadable: Bool = true) -> (top: HostWindowInfo?, parent: HostWindowInfo?) {
+                      namesReadable: Bool = true, hit: Int? = nil) -> (top: HostWindowInfo?, parent: HostWindowInfo?) {
         HostInputWindowList.under(point, in: windows, pointer: pointer, ownProcess: 34968, ownPanels: panels,
-                                  namesReadable: namesReadable, isWindowServer: isWindowServer)
+                                  namesReadable: namesReadable, hit: hit, isWindowServer: isWindowServer)
+    }
+
+    /// neo, 2026-11-03: the windows a read-only hit test looked through at the pointer.
+    private func hitTestWindows(at point: CGPoint) -> [HostWindowInfo] {
+        [HostWindowInfo(processID: 185, number: 3, ownerName: "Window Server", layer: cursorLayer,
+                        bounds: CGRect(x: point.x - 5, y: point.y - 5, width: 28, height: 40)),
+         HostWindowInfo(processID: 689, number: 57, ownerName: "Fruitctl Host", layer: 25,
+                        bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024)),
+         HostWindowInfo(processID: 607, number: 33, ownerName: "Notification Center", layer: 21,
+                        bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024)),
+         HostWindowInfo(processID: 6090, number: 211, ownerName: "Logic Pro", layer: 0,
+                        bounds: CGRect(x: 0, y: 30, width: 1637, height: 994)),
+         HostWindowInfo(processID: 1197, number: 113, ownerName: "cmux", layer: 0,
+                        bounds: CGRect(x: 0, y: 30, width: 1637, height: 994))]
+    }
+
+    func testAWindowInFrontOfTheHitWindowIsLookedThrough() {
+        let point = CGPoint(x: 800, y: 500)
+        let windows = hitTestWindows(at: point)
+        // The system hits Logic, through Notification Center (#186), with the
+        // pointer elsewhere so the cursor rule alone would not pass (#172).
+        XCTAssertEqual(pick(point, windows, pointer: CGPoint(x: 10, y: 900), hit: 211).top?.number, 211)
+    }
+
+    func testAWindowTheSystemHitsStaysRefusable() {
+        let point = CGPoint(x: 800, y: 500)
+        let windows = hitTestWindows(at: point)
+        // A banner that takes the click is the top window, as is another app.
+        XCTAssertEqual(pick(point, windows, pointer: nil, panels: [57], hit: 33).top?.number, 33)
+        XCTAssertEqual(pick(point, windows, pointer: nil, panels: [57], hit: 113).top?.number, 113)
+    }
+
+    func testAHitTheListCannotPlaceTellsNothing() {
+        let point = CGPoint(x: 800, y: 500)
+        let windows = hitTestWindows(at: point)
+        // No answer, a window new since the list read, or a window elsewhere:
+        // the list decides and Notification Center stays on top.
+        for hit in [nil, 4242] as [Int?] {
+            XCTAssertEqual(pick(point, windows, pointer: point, panels: [57], hit: hit).top?.number, 33)
+        }
+        var away = windows
+        away[3] = HostWindowInfo(processID: 6090, number: 211, ownerName: "Logic Pro", layer: 0,
+                                 bounds: CGRect(x: 1000, y: 800, width: 100, height: 100))
+        XCTAssertEqual(pick(point, away, pointer: point, panels: [57], hit: 211).top?.number, 33)
+    }
+
+    func testAFocusedServiceActsForTheTargetOnlyOverItsWindow() {
+        let view = HostWindowInfo(processID: 95123, number: 7000, ownerName: "AUHostingServiceXPC_arrow", layer: 3,
+                                  bounds: CGRect(x: 650, y: 320, width: 400, height: 300))
+        let plugin = HostWindowInfo(processID: 64374, number: 5757, ownerName: "Logic Pro", layer: 3,
+                                    bounds: CGRect(x: 639, y: 285, width: 538, height: 996))
+        let other = HostWindowInfo(processID: 700, number: 8000, ownerName: "GarageBand", layer: 3,
+                                   bounds: CGRect(x: 600, y: 300, width: 600, height: 400))
+        let panel = HostWindowInfo(processID: 34968, number: 5529, ownerName: "Fruitctl Host", layer: 3,
+                                   bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024))
+        func over(_ windows: [HostWindowInfo]) -> Bool {
+            HostInputWindowList.hasWindow(of: 95123, over: 64374, in: windows, ownProcess: 34968, ownPanels: [5529])
+        }
+        XCTAssertTrue(over([view, plugin]))
+        // The Host's own panel between them does not separate them.
+        XCTAssertTrue(over([view, panel, plugin]))
+        // One of its views is enough, wherever it is in the list.
+        let second = HostWindowInfo(processID: 95123, number: 7001, ownerName: "AUHostingServiceXPC_arrow", layer: 3,
+                                    bounds: CGRect(x: 1400, y: 900, width: 100, height: 100))
+        XCTAssertTrue(over([second, view, plugin]))
+        // Over another host, with no window, or no window of the target below it.
+        XCTAssertFalse(over([view, other, plugin]))
+        XCTAssertFalse(over([plugin]))
+        XCTAssertFalse(over([view]))
+    }
+
+    func testAPluginViewKeepsItsParentBehindALookedThroughWindow() {
+        let point = CGPoint(x: 700, y: 400)
+        let view = HostWindowInfo(processID: 95123, number: 7000, ownerName: "AUHostingServiceXPC_arrow", layer: 3,
+                                  bounds: CGRect(x: 650, y: 320, width: 400, height: 300))
+        let plugin = HostWindowInfo(processID: 6090, number: 5757, ownerName: "Logic Pro", layer: 3,
+                                    bounds: CGRect(x: 639, y: 285, width: 538, height: 996))
+        let center = hitTestWindows(at: point)[2]
+        let found = pick(point, [center, view, plugin], pointer: nil, hit: 7000)
+        XCTAssertEqual(found.top?.number, 7000)
+        XCTAssertEqual(found.parent?.number, 5757)
     }
 
     func testTheSoftwareCursorWindowIsLookedThroughAtThePointer() {
@@ -628,6 +709,7 @@ final class HostInputTests: XCTestCase {
         service.appleCodeIdentifier = "com.apple.audio.AUHostingService.arm64e"
         var value = environment(window: nil)
         value.focusOwner = service
+        value.focusOwnerOverFrontmost = true
         value.focusIsText = false
         let tune = try request(["kind": .string("type"), "text": .string("-0.22")])
         XCTAssertNoThrow(try HostInputGate.check(tune, value, start: true, pointerCheck: false))
@@ -637,6 +719,13 @@ final class HostInputTests: XCTestCase {
         }
         let selectAll = try request(["kind": .string("key"), "keys": .array([.string("cmd"), .string("a")])])
         XCTAssertNoThrow(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false))
+        // #185: the service also hosts other applications' views. Its focus
+        // counts only with its view over the target's window.
+        value.focusOwnerOverFrontmost = false
+        XCTAssertThrowsError(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false)) {
+            XCTAssertEqual($0 as? HostInputError, .targetMismatch)
+        }
+        value.focusOwnerOverFrontmost = true
         // An unrelated process holding focus is still refused.
         value.focusOwner = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
         XCTAssertThrowsError(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false)) {

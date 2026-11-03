@@ -17,6 +17,41 @@ enum HostLeaseError: String, Error {
     case staleSequence = "stale_sequence"
     case notReady = "helper_not_ready"
     case displayChanged = "display_generation_changed"
+    /// The Host ended this lease because its owner sent no agent request (#177).
+    case agentIdleReleased = "agent_idle_released"
+}
+
+/// #177: the Host's own bound on an activity whose owner sends no agent
+/// request. A broker that keeps renewing for an agent that stopped is cut off
+/// at `limitMilliseconds`, above the broker's own 600 s maximum. The cut owner's
+/// next renewal is refused by name, not as a lapsed lease (#185).
+struct HostAgentIdleClock {
+    static let limitMilliseconds: UInt64 = 660_000
+    private var lastRequestAt: UInt64?
+    private var cutOwner: (sessionID: String, connectionID: UUID)?
+    private(set) var releases = 0
+
+    /// A new lease starts its own clock, so it is never cut on an older lease's.
+    mutating func begin(at now: UInt64) {
+        lastRequestAt = now
+        cutOwner = nil
+    }
+
+    mutating func noteRequest(at now: UInt64) { lastRequestAt = now }
+
+    /// True when the active lease has gone the whole limit without an agent
+    /// request. The caller then ends the lease.
+    mutating func cut(_ lease: HostActivityLease?, at now: UInt64) -> Bool {
+        guard let lease, let last = lastRequestAt, now >= last &+ Self.limitMilliseconds else { return false }
+        lastRequestAt = nil
+        cutOwner = (lease.sessionID, lease.connectionID)
+        releases += 1
+        return true
+    }
+
+    func wasCut(sessionID: String?, connectionID: UUID) -> Bool {
+        cutOwner?.sessionID == sessionID && cutOwner?.connectionID == connectionID
+    }
 }
 
 /// Notifications latch independent holds. Waking the system does not silently

@@ -128,6 +128,35 @@ final class FruitctlHostTests: XCTestCase {
             now: now, uiHeartbeatAt: pulse, captureReady: capture, overlayReady: overlay)
     }
 
+    func testTheAgentIdleClockCutsAtItsLimitAndNamesTheCutOwner() throws {
+        let limit = HostAgentIdleClock.limitMilliseconds
+        let lease = try XCTUnwrap(try started().active)
+        var clock = HostAgentIdleClock()
+        // No lease, or a lease whose clock has not started, is never cut.
+        XCTAssertFalse(clock.cut(nil, at: limit * 2))
+        XCTAssertFalse(clock.cut(lease, at: limit * 2))
+        clock.begin(at: 1_000)
+        XCTAssertFalse(clock.cut(lease, at: 1_000 + limit - 1))
+        // A request restarts it; a tick without one reaches the limit.
+        clock.noteRequest(at: 2_000)
+        XCTAssertFalse(clock.cut(lease, at: 1_000 + limit))
+        XCTAssertFalse(clock.wasCut(sessionID: lease.sessionID, connectionID: lease.connectionID))
+        XCTAssertTrue(clock.cut(lease, at: 2_000 + limit))
+        XCTAssertEqual(clock.releases, 1)
+        // One cut per lease, whatever later ticks read.
+        XCTAssertFalse(clock.cut(lease, at: 3_000 + limit))
+        XCTAssertEqual(clock.releases, 1)
+        // Only that owner is told why.
+        XCTAssertTrue(clock.wasCut(sessionID: lease.sessionID, connectionID: lease.connectionID))
+        XCTAssertFalse(clock.wasCut(sessionID: lease.sessionID, connectionID: UUID()))
+        XCTAssertFalse(clock.wasCut(sessionID: "session-B", connectionID: lease.connectionID))
+        XCTAssertFalse(clock.wasCut(sessionID: nil, connectionID: lease.connectionID))
+        // A new lease starts clean, on its own clock.
+        clock.begin(at: 2_000 + limit)
+        XCTAssertFalse(clock.wasCut(sessionID: lease.sessionID, connectionID: lease.connectionID))
+        XCTAssertFalse(clock.cut(lease, at: 2_000 + limit))
+    }
+
     func testLeaseExpiresAtDeadlineAndLateRenewalCannotResurrectIt() throws {
         var state = try started()
         XCTAssertNoThrow(try state.requireOwner(sessionID: "session-A", connectionID: owner,

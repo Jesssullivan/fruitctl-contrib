@@ -598,29 +598,68 @@ enum HostInputWindowList {
         return isWindowServer(window.processID)
     }
 
+    /// The window AppKit says a mouse-down at a global point would hit, or nil
+    /// when it cannot tell. Read after the window list, so a window new since
+    /// that read is not in the list and tells nothing.
+    @MainActor
+    static func mouseDownWindow(at point: CGPoint) -> Int? {
+        // AppKit measures from the bottom of the main display, global points from its top.
+        let cocoa = NSPoint(x: point.x, y: CGDisplayBounds(CGMainDisplayID()).height - point.y)
+        let number = NSWindow.windowNumber(at: cocoa, belowWindowWithWindowNumber: 0)
+        return number > 0 ? number : nil
+    }
+
     /// The topmost window under `point` that can take the event, and its
     /// parent: the window directly below it in front-to-back order, when
     /// that one is at the same layer and contains it. A remote view such as
     /// an out-of-process AU view is ordered just above its host's window.
     /// The Host's own click-through indicator panels and the software cursor
     /// are looked through; the Host's status item and menu are not.
+    ///
+    /// `hit` is the window the system says a mouse-down at `point` would hit.
+    /// A window in front of it does not take the click, so it is looked
+    /// through too: on neo a full-screen Notification Center window at layer
+    /// 21 stays on screen while clicks reach Logic beneath it (#186). A `hit`
+    /// the list does not show there tells nothing, and the list alone decides.
     static func under(_ point: CGPoint, in windows: [HostWindowInfo], pointer: CGPoint?, ownProcess: pid_t,
-                      ownPanels: Set<Int>, namesReadable: Bool,
+                      ownPanels: Set<Int>, namesReadable: Bool, hit: Int? = nil,
                       isWindowServer: (pid_t) -> Bool) -> (top: HostWindowInfo?, parent: HostWindowInfo?) {
         func transparent(_ window: HostWindowInfo) -> Bool {
             window.alpha <= 0 || (window.processID == ownProcess && ownPanels.contains(window.number))
                 || isSoftwareCursor(window, pointer: pointer, namesReadable: namesReadable,
                                     isWindowServer: isWindowServer)
         }
-        guard let index = windows.firstIndex(where: { $0.bounds.contains(point) && !transparent($0) }) else {
+        let first = hit.flatMap { number in
+            windows.firstIndex { $0.number == number && $0.bounds.contains(point) }
+        } ?? windows.startIndex
+        guard let index = windows[first...].firstIndex(where: { $0.bounds.contains(point) && !transparent($0) }) else {
             return (nil, nil)
         }
+        return (windows[index], parent(of: index, in: windows, transparent: transparent))
+    }
+
+    private static func parent(of index: Int, in windows: [HostWindowInfo],
+                               transparent: (HostWindowInfo) -> Bool) -> HostWindowInfo? {
         let top = windows[index]
         // Windows elsewhere on screen do not separate a view from its host.
         let next = windows[(index + 1)...].first { !transparent($0) && $0.bounds.intersects(top.bounds) }
         guard let next, next.layer == top.layer,
-              next.bounds.insetBy(dx: -1, dy: -1).contains(top.bounds) else { return (top, nil) }
-        return (top, next)
+              next.bounds.insetBy(dx: -1, dy: -1).contains(top.bounds) else { return nil }
+        return next
+    }
+
+    /// Whether `owner` has a window whose parent, by the rule in `under`, is
+    /// `target`'s (#185). An AU hosting service holding focus acts for the
+    /// target only then.
+    static func hasWindow(of owner: pid_t, over target: pid_t, in windows: [HostWindowInfo], ownProcess: pid_t,
+                          ownPanels: Set<Int>) -> Bool {
+        func transparent(_ window: HostWindowInfo) -> Bool {
+            window.alpha <= 0 || (window.processID == ownProcess && ownPanels.contains(window.number))
+        }
+        return windows.indices.contains { index in
+            windows[index].processID == owner && !transparent(windows[index])
+                && parent(of: index, in: windows, transparent: transparent)?.processID == target
+        }
     }
 }
 
@@ -643,6 +682,8 @@ struct HostInputEnvironment: Equatable {
     var windowParentOwnerPID: pid_t?
     /// The focused element's owner and whether it is a secure text field.
     var focusOwner: HostInputProcess?
+    /// That owner has a window directly over the frontmost application's (#185).
+    var focusOwnerOverFrontmost = false
     var focusSecure: Bool = false
     var focusedWindowTitle: String?
     /// The focused element is a text input (field, area, combo or search).
@@ -775,8 +816,13 @@ enum HostInputGate {
         if start, !request.kind.pointer {
             if environment.focusSecure { throw HostInputError.secureInput }
             // #179: an AU view drawn out of process (Kontakt) holds focus in
-            // the target's AU hosting service.
-            let pluginFocus = environment.focusOwner.map { HostPluginHosting.serves($0, target: frontmost) } ?? false
+            // the target's AU hosting service. The service is shared by every
+            // host, so its view must be the one over the target's window (#185).
+            // A helper of the target is tied to it by its parent process.
+            let pluginFocus = environment.focusOwner.map { owner in
+                HostPluginHosting.serves(owner, target: frontmost)
+                    && (owner.parentProcessID == frontmost.processID || environment.focusOwnerOverFrontmost)
+            } ?? false
             if let owner = environment.focusOwner, owner.processID != frontmost.processID,
                owner.bundleID.map(panelServices.contains) != true, !pluginFocus {
                 throw HostInputError.targetMismatch
@@ -1202,7 +1248,8 @@ enum HostSystemInputEnvironment {
             }
             let (top, parent) = HostInputWindowList.under(point, in: windows.compactMap { HostWindowInfo($0) },
                 pointer: pointer, ownProcess: getpid(), ownPanels: ownPanels,
-                namesReadable: CGPreflightScreenCaptureAccess(), isWindowServer: isWindowServer)
+                namesReadable: CGPreflightScreenCaptureAccess(),
+                hit: HostInputWindowList.mouseDownWindow(at: point), isWindowServer: isWindowServer)
             if let top {
                 var owner = process(top.processID)
                 // Only another process's window needs the plug-in host reads.
@@ -1232,6 +1279,12 @@ enum HostSystemInputEnvironment {
                     // Another process's focus needs the plug-in host reads (#179).
                     environment.focusOwner = pid == environment.frontmost?.processID ? process(pid)
                         : HostProcessIdentity.describe(process(pid))
+                    if let front = environment.frontmost?.processID, pid != front,
+                       let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                                kCGNullWindowID) as? [[String: Any]] {
+                        environment.focusOwnerOverFrontmost = HostInputWindowList.hasWindow(of: pid, over: front,
+                            in: windows.compactMap { HostWindowInfo($0) }, ownProcess: getpid(), ownPanels: ownPanels)
+                    }
                 }
                 var role: AnyObject?, subrole: AnyObject?
                 _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)

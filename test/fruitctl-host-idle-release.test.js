@@ -221,6 +221,23 @@ test('a request during an unanswered release is refused before admission; the de
   } finally { await executor.close().catch(() => {}); }
 });
 
+test('a heartbeat the Host refuses after its own idle cut retires the lane by name', async () => {
+  let cut = false;
+  const { executor } = await executorFor({ idle: 0, alter(request, response) {
+    if (request.action === 'renew_activity' && cut) {
+      return { id: request.id, success: false, error: { code: -32000, message: 'agent_idle_released' } };
+    }
+    return response;
+  } });
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    cut = true;
+    await delay(800);
+    assert.equal(executor.failed?.code, 'agent_idle_released');
+    assert.match(executor.failed.message, /agent_idle_released/);
+  } finally { await executor.close().catch(() => {}); }
+});
+
 test('another session on the Host after an idle release is a per-call host_busy, and release still proves itself', async () => {
   let busy = false;
   const { executor, host } = await executorFor({ idle: 40, alter(request, response) {
