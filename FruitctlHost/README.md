@@ -14,8 +14,10 @@ re-checks that lease, the Stop latch, secure event input and the frontmost
 target. A press also checks the window under the pointer, looking through the
 software cursor. An Audio Unit's out-of-process view over the target's window
 counts as the target (#172). It never types into a secure field. It never moves the pointer into an active
-hot corner or the auto-hidden Dock's edge (#178). With no agent request for
-660 s it ends the activity itself, above the broker's own idle release (#177). With the same
+hot corner or the Dock's edge (#178). When the lease owner sends no agent
+request for 660 s it ends the activity itself, above the broker's own idle
+release (#177). Heartbeat renewals do not count; the broker marks the renewals
+an agent batch sends with `agent_request: true`. With the same
 opt-in, `ax_value` sets or steps one value control's `AXValue` and reads it
 back (#161). See the `input` row below and
 [the architecture notes](../docs/architecture.md#host-input-route).

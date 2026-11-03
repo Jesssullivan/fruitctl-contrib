@@ -577,11 +577,17 @@ final class HostInputTests: XCTestCase {
     // #178: hot corners and the auto-hidden Dock edge.
     func testScreenEdgesReadDockPreferences() {
         let edges = HostScreenEdges.from(cornerActions: [.topLeft: 0, .topRight: 1, .bottomLeft: 5, .bottomRight: 14],
-                                         dockAutohide: true, dockOrientation: "left")
+                                         dockOrientation: "left")
         XCTAssertEqual(edges.corners, [.bottomLeft, .bottomRight])
         XCTAssertEqual(edges.dockEdge, .left)
-        XCTAssertNil(HostScreenEdges.from(cornerActions: [:], dockAutohide: false, dockOrientation: "left").dockEdge)
-        XCTAssertEqual(HostScreenEdges.from(cornerActions: [:], dockAutohide: true, dockOrientation: nil).dockEdge, .bottom)
+        // Fail closed: an absent bottom-right key is the default Quick Note
+        // corner, an unreadable value is active, and the Dock edge always counts.
+        let defaults = HostScreenEdges.from(cornerActions: [:], dockOrientation: nil)
+        XCTAssertEqual(defaults.corners, [.bottomRight])
+        XCTAssertEqual(defaults.dockEdge, .bottom)
+        XCTAssertEqual(HostScreenEdges.from(cornerActions: [.topLeft: .some(nil), .bottomRight: 0],
+                                            dockOrientation: "right").corners, [.topLeft])
+        XCTAssertEqual(HostScreenEdges.from(cornerActions: [:], dockOrientation: "sideways").dockEdge, .bottom)
         let rects = edges.forbiddenRects(on: CGRect(x: 0, y: 0, width: 1637, height: 1024))
         XCTAssertTrue(rects.contains(CGRect(x: 1625, y: 1012, width: 12, height: 12)))
         XCTAssertTrue(rects.contains(CGRect(x: 0, y: 0, width: 4, height: 1024)))
@@ -711,5 +717,24 @@ final class HostInputTests: XCTestCase {
             if case .key(_, false, true, _) = $0 { return true }; return false
         }.count
         XCTAssertEqual(upsBefore, 2)
+    }
+
+    func testTheHostTakesShiftOnlyOnDragsAndBoundsTheDetail() throws {
+        XCTAssertNoThrow(try request(["kind": .string("drag"), "x": .integer(1), "y": .integer(1), "to_x": .integer(2),
+                                      "to_y": .integer(2), "modifiers": .array([.string("shift")])]))
+        for name in ["cmd", "alt", "ctrl"] {
+            XCTAssertThrowsError(try request(["kind": .string("drag"), "x": .integer(1), "y": .integer(1),
+                "to_x": .integer(2), "to_y": .integer(2), "modifiers": .array([.string("shift"), .string(name)])]), name)
+        }
+        XCTAssertNoThrow(try request(["kind": .string("click"), "x": .integer(1), "y": .integer(1),
+                                      "modifiers": .array([.string("cmd")])]))
+        var value = environment(window: HostInputProcess(processID: 9, bundleID: "a..b", executable: "x"))
+        value.windowOwnerName = String(repeating: "\u{1F600}", count: 40)
+        value.windowBounds = .null
+        let detail = HostInputGate.windowDetail(value)
+        XCTAssertEqual(detail["owner_bundle_id"], .null)
+        if case .string(let name)? = detail["owner_name"] { XCTAssertLessThanOrEqual(name.utf16.count, 64) }
+        else { XCTFail("owner_name missing") }
+        XCTAssertNil(detail["bounds"])
     }
 }

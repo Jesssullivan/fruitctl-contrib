@@ -74,10 +74,13 @@ test('a window check that stops an action reports the window with the count', as
     assert.equal(response.error.data.window.owner_name, 'Window Server');
     assert.equal(response.error.data.posted_events, 1);
   } finally { await executor.close(); }
+  // An unreadable detail is dropped; the stop is still reported.
   const forged = await executorFor(() => ({ posted_events: 1, completed: false, stop_reason: 'input_window_mismatch',
     stop_detail: { schema: 'fruitctl.host-window-refusal.v1', title: 'x' } }));
   try {
-    await assert.rejects(forged.execute([{ action: 'mouse_click', x: 10, y: 10 }]), /Invalid host-helper input receipt/);
+    const [response] = await forged.execute([{ action: 'mouse_click', x: 10, y: 10 }]);
+    assert.equal(response.error.data.reason, 'input_window_mismatch');
+    assert.equal(response.error.data.window, undefined);
   } finally { await forged.close(); }
 });
 
@@ -89,5 +92,21 @@ test('a screen-edge refusal is a typed per-call error that keeps the lane', asyn
     assert.equal(responses.length, 1);
     assert.equal(responses[0].error.data.code, 'input_screen_edge');
     assert.equal(executor.failed, undefined);
+  } finally { await executor.close(); }
+});
+
+test('renewals for agent batches are marked; heartbeats are not; a wait-only batch renews', async () => {
+  const hosts = hostSequence({ capabilities: ['input', 'capture_scope'] });
+  const executor = await nativeFactory(hostOnlyProfile({ hostInput: { applications: [LOGIC] } }),
+    { hostSpawn: hosts.spawnImpl, hostActivityIdleMs: 0 });
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    await new Promise(resolve => setTimeout(resolve, 1300));
+    const renewals = () => hosts.attachments[0].requests.filter(request => request.action === 'renew_activity');
+    assert.ok(renewals().some(request => request.params.agent_request === true));
+    assert.ok(renewals().some(request => request.params.agent_request === undefined), 'heartbeats stay unmarked');
+    const before = renewals().filter(request => request.params.agent_request === true).length;
+    await executor.execute([{ action: 'wait', ms: 50 }]);
+    assert.equal(renewals().filter(request => request.params.agent_request === true).length, before + 1);
   } finally { await executor.close(); }
 });

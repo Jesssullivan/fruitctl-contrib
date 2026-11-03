@@ -16,26 +16,38 @@ struct HostScreenEdges: Equatable {
     static let none = HostScreenEdges(corners: [], dockEdge: nil)
 
     var corners: Set<Corner>
-    /// The auto-hidden Dock's edge; nil when the Dock stays shown.
+    /// The Dock's edge. It is forbidden whether or not the Dock hides.
     var dockEdge: Edge?
 
-    /// `wvous-<corner>-corner` values 0 and 1 mean no action. An unreadable
-    /// orientation is the default, bottom.
-    static func from(cornerActions: [Corner: Int], dockAutohide: Bool, dockOrientation: String?) -> HostScreenEdges {
-        HostScreenEdges(corners: Set(cornerActions.filter { $0.value > 1 }.keys),
-                        dockEdge: dockAutohide ? Edge(rawValue: dockOrientation ?? "bottom") ?? .bottom : nil)
+    /// `wvous-<corner>-corner` values 0 and 1 mean no action; any other value,
+    /// or one that cannot be read, is active. An absent bottom-right key is
+    /// macOS's default Quick Note corner. The Dock's edge is forbidden even
+    /// when the Dock stays shown: a full-screen window still reveals it there.
+    static func from(cornerActions: [Corner: Int?], dockOrientation: String?) -> HostScreenEdges {
+        var corners: Set<Corner> = []
+        for corner in Corner.allCases {
+            switch cornerActions[corner] {
+            case .some(.some(let action)): if action > 1 { corners.insert(corner) }
+            case .some(.none): corners.insert(corner)
+            case .none: if corner == .bottomRight { corners.insert(corner) }
+            }
+        }
+        return HostScreenEdges(corners: corners, dockEdge: Edge(rawValue: dockOrientation ?? "bottom") ?? .bottom)
     }
 
     /// Reads the current user's `com.apple.dock` preferences.
     static func read() -> HostScreenEdges {
         let domain = "com.apple.dock" as CFString
-        func value(_ key: String) -> Any? { CFPreferencesCopyAppValue(key as CFString, domain) }
-        var actions: [Corner: Int] = [:]
+        _ = CFPreferencesAppSynchronize(domain)
+        var actions: [Corner: Int?] = [:]
         for corner in Corner.allCases {
-            actions[corner] = (value("wvous-\(corner.rawValue)-corner") as? NSNumber)?.intValue ?? 0
+            guard let value = CFPreferencesCopyAppValue("wvous-\(corner.rawValue)-corner" as CFString, domain) else {
+                continue
+            }
+            actions[corner] = .some((value as? NSNumber)?.intValue)
         }
-        return from(cornerActions: actions, dockAutohide: (value("autohide") as? NSNumber)?.boolValue ?? false,
-                    dockOrientation: value("orientation") as? String)
+        return from(cornerActions: actions,
+                    dockOrientation: CFPreferencesCopyAppValue("orientation" as CFString, domain) as? String)
     }
 
     /// Rectangles in global points on `display` that the pointer must avoid.

@@ -207,6 +207,9 @@ struct HostInputRequest: Equatable {
                       !modifiers.contains(where: { $0.code == modifier.code }) else { throw invalid }
                 modifiers.append(modifier)
             }
+            // #180: a drag holds Shift only. Cmd, Ctrl and Option turn it into
+            // another command; the Host enforces this as well as the broker.
+            if kind == .drag, modifiers.contains(where: { $0.flag != .maskShift }) { throw invalid }
         }
         var dx: Int32 = 0, dy: Int32 = 0
         if kind == .scroll {
@@ -694,25 +697,36 @@ enum HostInputGate {
     /// #182: what the window under the pointer is, for a refusal. Process
     /// name and identifiers, level and bounds; never the window's title.
     static func windowDetail(_ environment: HostInputEnvironment) -> [String: HostValue] {
+        // UTF-16 units, as the broker counts them; never a broken surrogate pair.
         func text(_ value: String?, _ limit: Int) -> HostValue {
             guard let value else { return .null }
-            let clean = String(value.unicodeScalars.filter { $0.value >= 32 && $0.value != 127 }.prefix(limit))
+            var clean = ""
+            for character in value where character.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) {
+                guard clean.utf16.count + String(character).utf16.count <= limit else { break }
+                clean.append(character)
+            }
             return .string(clean)
+        }
+        func identifier(_ value: String?) -> HostValue {
+            guard let value, HostInputTarget.validBundle(value), !value.contains("..") else { return .null }
+            return .string(value)
         }
         var detail: [String: HostValue] = ["schema": .string("fruitctl.host-window-refusal.v1")]
         if let owner = environment.windowOwner {
             detail["owner_pid"] = .integer(Int64(owner.processID))
             detail["owner_name"] = text(environment.windowOwnerName ?? owner.executable, 64)
-            detail["owner_bundle_id"] = owner.bundleID.flatMap { HostInputTarget.validBundle($0) ? .string($0) : nil } ?? .null
-            detail["owner_code_id"] = owner.appleCodeIdentifier.flatMap { HostInputTarget.validBundle($0) ? .string($0) : nil } ?? .null
+            detail["owner_bundle_id"] = identifier(owner.bundleID)
+            detail["owner_code_id"] = identifier(owner.appleCodeIdentifier)
         } else {
             detail["owner_pid"] = .null
         }
         detail["window_server"] = .boolean(environment.windowOwnerIsWindowServer)
         detail["layer"] = environment.windowLayer.map { .integer(Int64(clamping: $0)) } ?? .null
-        if let bounds = environment.windowBounds, bounds.width.isFinite, bounds.height.isFinite {
-            detail["bounds"] = .object(["x": .integer(Int64(bounds.minX.rounded())), "y": .integer(Int64(bounds.minY.rounded())),
-                "width": .integer(Int64(bounds.width.rounded())), "height": .integer(Int64(bounds.height.rounded()))])
+        if let bounds = environment.windowBounds, !bounds.isNull, !bounds.isInfinite,
+           let x = Int64(exactly: bounds.minX.rounded()), let y = Int64(exactly: bounds.minY.rounded()),
+           let width = Int64(exactly: bounds.width.rounded()), let height = Int64(exactly: bounds.height.rounded()) {
+            detail["bounds"] = .object(["x": .integer(x), "y": .integer(y), "width": .integer(width),
+                                        "height": .integer(height)])
         }
         detail["parent_owner_pid"] = environment.windowParentOwnerPID.map { .integer(Int64($0)) } ?? .null
         detail["frontmost_pid"] = environment.frontmost.map { .integer(Int64($0.processID)) } ?? .null
@@ -769,8 +783,11 @@ enum HostInputGate {
             }
             // Typing needs a readable text input; an unreadable or non-text
             // focus would turn characters into the target's key commands.
-            // A plug-in's own value field is not readable through AX; it may
-            // take a short number only, which no key command is made of.
+            // A plug-in's own value field is not readable through AX, so it may
+            // take a short number only. Digits, signs and points are key
+            // commands in Logic too (screensets, transport), exactly as a
+            // key_tap of them already is; the agent clicks into the field first
+            // and checks the readback frame.
             if request.kind == .type, environment.focusOwner == nil
                 || !(environment.focusIsText || (pluginFocus && numericEntry(request.text ?? ""))) {
                 throw HostInputError.focusUnavailable

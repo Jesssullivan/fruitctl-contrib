@@ -91,6 +91,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     /// A broker that keeps renewing for an agent that stopped is cut off at
     /// `agentIdleMilliseconds`, above the broker's own 600 s maximum.
     private var lastAgentRequestAt: UInt64?
+    private var agentIdleReleases = 0
     static let agentIdleMilliseconds: UInt64 = 660_000
     private let inputPreferences: HostInputPreferences
     private let inputPoster = HostSystemInputPoster()
@@ -419,6 +420,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         if lease.expire(at: now) { clearActivityUI() }
         if lease.active != nil, let last = lastAgentRequestAt, now >= last &+ Self.agentIdleMilliseconds {
             lease.invalidate(); clearActivityUI()
+            agentIdleReleases += 1
         }
         if lease.active != nil || idleReference.armedID != nil || idleReference.isExporting {
             if !activityEligible { invalidateActivity(reason: .activityUnavailable) }
@@ -574,7 +576,24 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         return result
     }
 
+    /// #177: the idle clock moves only for the lease owner's own successful
+    /// agent requests, never for a refused request or another connection, and
+    /// never for a heartbeat. The broker marks the renewals an agent batch
+    /// sends with `agent_request: true`.
+    static let agentRequestActions: Set<String> = ["begin_activity", "capture", "screenshot", "ax_snapshot",
+                                                   "ax_action", "ax_verify", "input", "ax_value"]
+
     private func handle(_ request: HostRequest, connectionID: UUID) async -> HostResponse {
+        let response = await handleRequest(request, connectionID: connectionID)
+        let agentRenewal = request.action == "renew_activity" && request.params["agent_request"] == .boolean(true)
+        if response.success, Self.agentRequestActions.contains(request.action) || agentRenewal,
+           lease.active?.connectionID == connectionID {
+            lastAgentRequestAt = clock.milliseconds()
+        }
+        return response
+    }
+
+    private func handleRequest(_ request: HostRequest, connectionID: UUID) async -> HostResponse {
         let now = clock.milliseconds()
         if lease.expire(at: now) { clearActivityUI() }
         // A health reply reports the same permission sample that guarded its
@@ -583,10 +602,6 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         if (lease.active != nil || idleReference.armedID != nil || idleReference.isExporting)
             && !(healthPermissionGranted ?? permission.isGranted) {
             invalidateActivity(reason: .permissionUnavailable)
-        }
-        if ["begin_activity", "capture", "screenshot", "ax_snapshot", "ax_action", "ax_verify", "input",
-            "ax_value"].contains(request.action) {
-            lastAgentRequestAt = now
         }
         do {
             switch request.action {
@@ -619,6 +634,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["request_pipelining"] = .boolean(true)
                 // #177: the Host's own bound on an activity with no agent request.
                 status["agent_idle_release_ms"] = .integer(Int64(Self.agentIdleMilliseconds))
+                status["agent_idle_releases"] = .integer(Int64(agentIdleReleases))
                 // Capture and AX replies may be split with reply_part_bytes.
                 status["reply_parts"] = .boolean(true)
                 status["image_formats"] = .array([HostImageFormat.png, .jpeg].map { .string($0.rawValue) })
