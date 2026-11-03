@@ -62,6 +62,65 @@ let
       hostHelperFile = "/Users/fruitctl-test/private/host-binding.json";
     };
   }).home.file."Library/Application Support/fruitctl/config.json".text).targets.desktop;
+  # A Host-only route renders only what the broker accepts for it, even when the
+  # controller also selects a native client for its VNC targets.
+  hostOnlyBinding = { targetId = "fixture-mac"; hostHelperFile = "/Users/fruitctl-test/private/host-binding.json"; };
+  hostOnly = settings: { enable = true; targets.mac = { transport = "host-only"; } // hostOnlyBinding // settings; };
+  hostOnlyDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly {
+    hostInput = { applications = [ "com.apple.logic10" ]; operatorInput = "assert"; };
+    hostCapture.scope = "display";
+    hostActivityIdleMs = 0;
+  } // { nativePackage = fruitctlFlake.packages.aarch64-darwin.native-controller; })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
+  hostOnlyMinimalDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly { })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
+  hostOnlyHelper = { sshHost = "fixture-mac"; command = [ "/Users/fruitctl-test/Applications/FruitctlHost.app/Contents/MacOS/FruitctlHost" "--stdio" ]; displayId = 1; };
+  hostOnlyInlineDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly { hostHelperFile = null; hostHelper = hostOnlyHelper; })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
+  # One controller serves a Host-only target beside a VNC target.
+  hostOnlyBesideVnc = (builtins.fromJSON (evaluate "aarch64-darwin" (pkgs.lib.recursiveUpdate (hostOnly { }) {
+    targets.desktop = {
+      targetId = "fixture-desktop";
+      credentialFile = "/Users/fruitctl-test/private/password";
+      daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon";
+    };
+  })).home.file."Library/Application Support/fruitctl/config.json".text).targets;
+  hostOnlyRejected = builtins.all (extra: rejected "aarch64-darwin" (hostOnly extra)) [
+    { targetId = null; hostHelperFile = null; hostHelper = hostOnlyHelper; }
+    { hostHelperFile = null; hostHelper = hostOnlyHelper // { mapping = { qualificationReceipt = "fixture"; displayId = 1; nativeWidth = 1; nativeHeight = 1; scaledWidth = 1; scaledHeight = 1; displayBounds = { x = 0; y = 0; width = 1; height = 1; }; }; }; }
+    { credential = { provider = "file"; path = "/Users/fruitctl-test/private/password"; }; }
+    { secrets.login = { provider = "file"; path = "/Users/fruitctl-test/private/login"; }; }
+    { hostCapture.scope = "target"; }
+    { targetId = null; }
+    { hostHelperFile = null; }
+    { vnc.username = "fixture-user"; }
+    { credentialFile = "/Users/fruitctl-test/private/password"; }
+    { daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon"; }
+    { clipboard.read = true; }
+    { input.pasteUnmappable = true; }
+    { hostInput.applications = [ ]; }
+    { hostInput.applications = [ "com.apple.logic10" "com.apple.logic10" ]; }
+    { hostInput.applications = [ "not a bundle" ]; }
+    { hostCapture = { scope = "display"; applications = [ "com.apple.logic10" ]; }; }
+    { hostCapture = { scope = "target"; exclude = [ "com.apple.logic10" ]; }; }
+    { hostActivityIdleMs = 500; }
+    { hostActivityIdleMs = 600001; }
+  ]
+  # Host policy has no meaning on the VNC route, and Linux declares names only.
+  && builtins.all (extra: rejected "aarch64-darwin" {
+    enable = true;
+    targets.desktop = {
+      credentialFile = "/Users/fruitctl-test/private/password";
+      daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon";
+    } // extra;
+  }) [ { hostInput.applications = [ "com.apple.logic10" ]; } { hostCapture.scope = "display"; } { hostActivityIdleMs = 0; } ]
+  && builtins.all (extra: rejected "x86_64-linux" { enable = true; bridgeHost = "darwin-bridge"; targets.desktop = extra; })
+    [ { transport = "host-only"; } { hostActivityIdleMs = 0; } ]
+  # A second profile for one desktop is refused at evaluation, as the broker does.
+  && rejected "aarch64-darwin" (pkgs.lib.recursiveUpdate (hostOnly { }) {
+    targets.desktop = {
+      targetId = "fixture-mac";
+      credentialFile = "/Users/fruitctl-test/private/password";
+      daemonPath = "/Users/fruitctl-test/Applications/qualified-native/claude-kvm-daemon";
+    };
+  });
   attachmentRejected = builtins.all (extra: rejected "aarch64-darwin" {
     enable = true;
     targets.desktop = {
@@ -380,6 +439,20 @@ assert !(nativeDocument.targets.desktop ? wake) && !(nativeDocument.targets.desk
 assert sentinelOffDocument.wake == { ssh = "fixture-user@fixture-target"; enabled = false; };
 assert sentinelOffDocument.desktopState == { ssh = "console-user@fixture-target"; enabled = false; };
 assert attachmentRejected;
+assert hostOnlyDocument == {
+  transport = "host-only";
+  targetId = "fixture-mac";
+  hostHelperFile = "/Users/fruitctl-test/private/host-binding.json";
+  hostInput = { applications = [ "com.apple.logic10" ]; operatorInput = "assert"; };
+  hostCapture = { scope = "display"; };
+  hostActivityIdleMs = 0;
+};
+assert hostOnlyMinimalDocument == { transport = "host-only"; targetId = "fixture-mac"; hostHelperFile = "/Users/fruitctl-test/private/host-binding.json"; };
+assert hostOnlyInlineDocument.hostHelper.sshHost == "fixture-mac" && !(hostOnlyInlineDocument ? hostHelperFile) && !(hostOnlyInlineDocument ? vnc);
+assert hostOnlyBesideVnc.mac.transport == "host-only" && !(hostOnlyBesideVnc.mac ? daemonPath);
+assert hostOnlyBesideVnc.desktop.credentialFile == "/Users/fruitctl-test/private/password" && hostOnlyBesideVnc.desktop ? vnc;
+assert !(rejected "aarch64-darwin" (hostOnly { hostCapture.scope = "target"; hostInput.applications = [ "com.apple.logic10" ]; }));
+assert hostOnlyRejected;
 assert darwinDocument.targets.desktop.credentialFile == "/Users/fruitctl-test/.config/private/desktop-password";
 assert helperDocument.targets.desktop.hostHelper.mapping.displayBounds.x == -1920;
 assert helperDocument.targets.desktop.hostHelper.mapping.nativeWidth == 3840;

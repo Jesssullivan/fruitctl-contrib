@@ -427,3 +427,39 @@ The operator materializes and qualifies the binding on the configured Darwin
 controller. Nix emits only its pathname. Loading a binding does not start the
 Host, enable capture or grant privacy permissions. A qualified Host session
 starts its indicator when it acquires activity and clears it on release.
+
+## Host-only target
+
+A Host-only profile drives a Mac through its installed Fruitctl Host, with no
+VNC connection, credential or native client. The controller can serve it beside
+VNC targets, and `nativePackage` then applies to the VNC targets only.
+
+```nix
+programs.fruitctl.targets.desk = {
+  transport = "host-only";
+  targetId = "desk-mac";
+  hostHelperFile = "/Users/you/Library/Application Support/fruitctl/desk-host-binding.json";
+  hostInput = {
+    applications = [ "com.example.editor" ];
+    operatorInput = "assert";
+  };
+};
+```
+
+`hostInput` lists the applications the Host may send input to. Without it the
+route is observation-only. `hostCapture` and `hostActivityIdleMs` are optional,
+and an unset field keeps the broker default. See
+[Host input](architecture.md) for the gates and policy values.
+
+The profile renders only the fields the broker accepts on this route, so setting
+`vnc`, a credential, `secrets`, `daemonPath`, `input` or `clipboard` on it is an
+evaluation error. Host policy on a VNC profile is an evaluation error too.
+
+The broker refuses its whole configuration when a binding file is missing or its
+directory is not private, which stops every target on that controller. Home
+Manager creates `Application Support/fruitctl` without tightening its mode, so
+set that directory to 0700 and place the binding before the switch that first
+names it.
+
+A Linux relay reaches the profile by name: declare `targets.desk = { }` there
+and run `fruitctl mcp --target desk`.
