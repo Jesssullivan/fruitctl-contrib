@@ -110,6 +110,13 @@ protocol HostAXNode {
     func liveState() -> HostAXLiveRead
     /// Exactly one Accessibility call; no synthetic events are posted.
     func perform(_ operation: HostAXOperation) -> HostAXPerformResult
+    /// #161: one AXUIElementSetAttributeValue on AXValue, typed like the
+    /// element's current value. No synthetic events are posted.
+    func setValue(_ value: HostAXValueInput) -> HostAXPerformResult
+}
+
+extension HostAXNode {
+    func setValue(_ value: HostAXValueInput) -> HostAXPerformResult { .unsupported }
 }
 
 struct HostAXApplication {
@@ -347,6 +354,10 @@ struct HostSystemAXNode: HostAXNode, @unchecked Sendable {
         if AXUIElementIsAttributeSettable(element, "AXFocused" as CFString, &settable) == .success {
             state.focusSettable = settable.boolValue
         }
+        var valueSettable: DarwinBoolean = false
+        if !secure, AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &valueSettable) == .success {
+            state.valueSettable = valueSettable.boolValue
+        }
         var owner: pid_t = 0
         if AXUIElementGetPid(element, &owner) == .success, owner > 0 { state.ownerProcessID = owner }
         return .live(state)
@@ -356,9 +367,35 @@ struct HostSystemAXNode: HostAXNode, @unchecked Sendable {
         switch operation {
         case .focus:
             return HostAXPerformResult(AXUIElementSetAttributeValue(element, "AXFocused" as CFString, kCFBooleanTrue))
-        case .press, .showMenu, .raise:
+        case .press, .showMenu, .raise, .increment, .decrement:
             return HostAXPerformResult(AXUIElementPerformAction(element, operation.rawValue as CFString))
         }
+    }
+
+    /// Reads before it sets; a failed read sets nothing and is reported as
+    /// unsupported. A numeric value outside the element's reported AXMinValue
+    /// and AXMaxValue is not sent.
+    func setValue(_ input: HostAXValueInput) -> HostAXPerformResult {
+        var current: AnyObject?
+        let status = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &current)
+        if status == .invalidUIElement { return .invalid }
+        guard status == .success || status == .noValue else { return .unsupported }
+        let numeric = current.map { CFGetTypeID($0) == CFNumberGetTypeID() } ?? false
+        // Text goes only to an element whose value is text or empty.
+        if !numeric, let current, CFGetTypeID(current) != CFStringGetTypeID() { return .unsupported }
+        guard let value = input.axValue(numeric: numeric) else { return .unsupported }
+        if numeric, let requested = (value as? NSNumber)?.doubleValue {
+            if let minimum = numericAttribute(kAXMinValueAttribute), requested < minimum { return .unsupported }
+            if let maximum = numericAttribute(kAXMaxValueAttribute), requested > maximum { return .unsupported }
+        }
+        return HostAXPerformResult(AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value))
+    }
+
+    private func numericAttribute(_ attribute: String) -> Double? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value,
+              CFGetTypeID(value) == CFNumberGetTypeID() else { return nil }
+        return (value as? NSNumber)?.doubleValue
     }
 
     private static func boolean(_ value: AnyObject) -> Bool? {

@@ -594,7 +594,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["idle_reference_exporting"] = .boolean(idleReference.isExporting)
                 status["capabilities"] = .array(["capture", "begin_activity", "renew_activity",
                                                  "release_activity", "export_idle_reference",
-                                                 "ax_snapshot", "ax_action", "input", "capture_scope"].map { .string($0) })
+                                                 "ax_snapshot", "ax_action", "input", "capture_scope",
+                                                 "ax_value"].map { .string($0) })
                 // #157: input posts CGEvents only under the local opt-in,
                 // the Accessibility grant and a live, indicated lease.
                 status["input_service"] = .boolean(inputPreferences.isEnabled && HostSystemInputPoster.permitted)
@@ -782,6 +783,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 return .ok(request, try await axVerify(request, connectionID: connectionID))
             case "input":
                 return .ok(request, try await hostInput(request, connectionID: connectionID))
+            case "ax_value":
+                return .ok(request, try await axValue(request, connectionID: connectionID))
             case "export_idle_reference":
                 try validateDisplay(request)
                 guard try request.requiredString("instance_id") == instanceID else {
@@ -1028,6 +1031,91 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 outcome.metadata(input, frontmost: frontmost, monitor: inputMonitor.mode))]) { _, value in value }
         } catch let refusal as HostInputError {
             // Raised before the first event: nothing was posted.
+            throw refusal
+        } catch let refusal as HostAXActionError {
+            throw refusal
+        } catch {
+            if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+            throw error
+        }
+    }
+
+    /// #161: sets one element's AXValue, or steps it with AXIncrement or
+    /// AXDecrement, then reads the value back. It is input: it needs the local
+    /// opt-in, a live indicated lease, no secure input, the target frontmost
+    /// and, under `yield`, an idle operator. The element must be a value
+    /// control owned by the target or its AU hosting process (#172). Refusals
+    /// before the first AX call keep the lease; a later stop reports how many
+    /// steps ran. Nothing is retried.
+    private func axValue(_ request: HostRequest, connectionID: UUID) async throws -> [String: HostValue] {
+        try validateDisplay(request)
+        try requireAvailable()
+        let valueRequest = try HostAXValueRequest.parse(request.params)
+        let session = try request.requiredString("session_id")
+        let displayID = capture.displayID
+        guard let geometry = HostDisplayGeometry.current(displayID) else { throw HostCaptureError.displayUnavailable }
+        _ = try requireAXOwner(session: session, connectionID: connectionID, displayID: displayID, geometry: geometry)
+        guard inputPreferences.isEnabled else { throw HostInputError.disabled }
+        guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
+              !idleReference.isExporting else { throw HostLeaseError.notReady }
+        guard let snapshot = axGeneration else { throw HostAXActionError.staleRef }
+        let target = try snapshot.resolve(generation: valueRequest.generation, ref: valueRequest.ref,
+                                          sessionID: session, displayGeneration: generation, geometry: geometry)
+        inputMonitor.start()
+        axActionInProgress = true
+        defer { axActionInProgress = false }
+        let node = target.node
+        let runner = HostAXValueRunner(request: valueRequest, node: node, snapshotProcessID: target.processID,
+            lease: { [unowned self] in
+                _ = try self.requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                            geometry: geometry)
+                guard self.inputPreferences.isEnabled else { throw HostInputError.disabled }
+                guard self.server?.connectionIsLive(connectionID) == true else { throw HostLeaseError.expired }
+                guard !self.humanMenuOpen else { throw HostInputError.operatorInput }
+            },
+            environment: { [unowned self] in
+                HostSystemInputEnvironment.read(point: nil, start: true, keyboard: false, wantsTitle: false,
+                    executable: { self.accessibility.executableName(processID: $0) }, monitor: self.inputMonitor,
+                    now: self.clock.milliseconds(), ownPanels: [])
+            },
+            describe: { [unowned self] pid in
+                guard let pid else { return nil }
+                let process = HostInputProcess(processID: pid,
+                    bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+                    executable: self.accessibility.executableName(processID: pid))
+                return pid == target.processID ? process : HostProcessIdentity.describe(process)
+            },
+            now: { [clock] in clock.milliseconds() },
+            liveState: { await Task.detached(priority: .userInitiated) { node.liveState() }.value },
+            verify: { previous, budget in
+                let operation = valueRequest.operation, requested = valueRequest.value
+                let deadline = DispatchTime.now().uptimeNanoseconds + budget
+                return await Task.detached(priority: .userInitiated) {
+                    HostAXValueVerifier.poll(operation, requested: requested, before: previous,
+                        read: { node.liveState() }, expired: { DispatchTime.now().uptimeNanoseconds >= deadline },
+                        pause: { usleep(useconds_t(HostAXActionPlanner.pollNanoseconds / 1_000)) })
+                }.value
+            })
+        do {
+            var outcome = try await runner.run()
+            var current: HostActivityLease?
+            if !outcome.leaseLost {
+                current = try? requireAXOwner(session: session, connectionID: connectionID, displayID: displayID,
+                                              geometry: geometry)
+            }
+            guard let current else {
+                // The lease ended after an AX call (Stop, expiry, display
+                // change). Report what ran; the controller retires its lane.
+                outcome.leaseLost = true
+                if outcome.stopReason == nil { outcome.stopReason = "lease_lost" }
+                if lease.release(connectionID: connectionID, sessionID: session) { clearActivityUI() }
+                return ["instance_id": .string(instanceID), "session_id": .string(session),
+                        "lease_lost": .boolean(true), "ax_value": .object(outcome.metadata)]
+            }
+            return readiness(now: clock.milliseconds(), activity: current)
+                .merging(["ax_value": .object(outcome.metadata)]) { _, value in value }
+        } catch let refusal as HostInputError {
+            // Raised before the first AX call that could change the element.
             throw refusal
         } catch let refusal as HostAXActionError {
             throw refusal

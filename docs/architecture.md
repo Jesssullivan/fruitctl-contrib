@@ -431,13 +431,29 @@ on this route.
 | Live lease, fresh indicator heartbeat, unchanged display, no Stop | Host, before every event | the lease error ends the action |
 | `IsSecureEventInputEnabled`, or a focused secure text field | Host, before every event | `secure_input_active` |
 | Frontmost app is the target; optional pid and window title | Host, before every event | `input_target_mismatch` |
-| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. The Host's own status item and menu are refused | Host | `input_window_mismatch` |
+| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. An AU hosting process for the target also qualifies when the target's own window lies directly beneath it (#172). The Host's own status item and menu are refused | Host | `input_window_mismatch` |
 | Key combinations macOS or the Dock handle: app and Space switching, Spotlight, input sources, force quit, lock, log out | Host | `input_system_shortcut` |
 | Typing needs a readable focused text input of the target. A newline or tab ends its request | Host | `input_focus_unavailable` |
 | Consent and authorization dialog owners | Host | `human_consent_required` |
 | Operator input: `yield` refuses or stops, `assert` continues and counts. `yield` needs a live event tap, and the keyboard tap for key and text input | Host | `operator_input_detected`, `operator_input_monitor_unavailable` |
 | The local Fruitctl menu is open | Host, every event | the action stops |
 | `activate_app` waits for 2 s of operator idle under either policy | Host | `operator_input_detected` |
+
+The window check looks through the Host's click-through indicator panels and the
+Window Server's software cursor (#172). That cursor is an unnamed window at the
+cursor level, at most 256 by 256 points, around the pointer. Once the pointer
+reaches the point, it is the topmost window there and receives no events. The
+owner must be the Window Server by its Apple-anchored signing identifier
+`com.apple.WindowServer`, not by name, and window names must be readable
+through the Screen Recording grant. The menu bar is identified the same way.
+
+An AU hosting process is an Apple-anchored
+`com.apple.audio.AUHostingService.arm64e` or `.x86-64`, or a helper of the
+target: a child process that is not a regular application and runs an
+executable inside the target's bundle. Its window acts for the target only when
+the window directly below it in front-to-back order is the target's, at the
+same layer, and contains it. A remote view is ordered that way over its host's
+window. Logic's main window, at another layer, does not qualify.
 
 A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
@@ -459,6 +475,34 @@ Health reports which method runs as `operator_input_monitor`. The fallback
 cannot tell operator keys from the Host's own during typing, so `yield` refuses
 key and text input without the keyboard tap. Qualification of the tap, timing and
 Space behaviour on a live desktop is an attended gate.
+
+### Element values
+
+`set_element_value {ref, value, app?}` sets one element's `AXValue`, and
+`step_element {ref, steps, app?}` performs `AXIncrement` or `AXDecrement` up to
+10 times (#161). They need the same `hostInput` policy, local opt-in, live
+lease, secure-input check, frontmost target and `yield` idle time as posted
+input. The element must be an `AXSlider`, `AXTextField`, `AXIncrementor` or
+`AXComboBox` that is enabled, with a settable value or the step action. Its
+owner must be the target, or the target's AU hosting process reached through
+the target's own snapshot. The Host sets a
+number for an element whose value is a number, and text otherwise. It then
+reads the value back within 250 milliseconds for a set and 120 milliseconds
+for each step. The reply carries `value_before`, `value_after`, `owner`,
+`steps_performed` and `verified`. A refusal before the first AX call keeps the
+lease. Under `yield` the Host refuses with `operator_input_monitor_unavailable`
+when only event times are available. After the first AX call, any stop ends
+the batch as `input_interrupted` with the calls that ran and the readback:
+
+- `value_unverified`: the value did not read back.
+- `ax_indeterminate`: a call may still act later.
+- `operator_input_detected`, Stop or a target change between steps.
+- `budget_exhausted`: no step starts after 1.2 seconds, counted from the first read.
+
+`verified: false` can still mean the control changed, for example to a rounded
+value. Read `value_after` before acting again. When the lease itself ends after
+an AX call, the lane retires with the count. Nothing is retried. A numeric value
+outside the element's `AXMinValue` and `AXMaxValue` is not sent.
 
 ## Host capture scope
 
