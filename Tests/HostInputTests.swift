@@ -490,8 +490,11 @@ final class HostInputTests: XCTestCase {
         away[3] = HostWindowInfo(processID: 6090, number: 211, ownerName: "Logic Pro", layer: 0,
                                  bounds: CGRect(x: 1000, y: 800, width: 100, height: 100))
         XCTAssertEqual(pick(point, away, pointer: point, panels: [57], hit: 211).top?.number, 33)
-        // Nor does a hit on the list's first window count when that window is elsewhere.
-        XCTAssertNotEqual(pick(point, away, pointer: CGPoint(x: 10, y: 900), panels: [57], hit: 3).top?.number, 3)
+        // Nor does a hit count on the list's first window when that window is elsewhere.
+        var moved = windows
+        moved[0] = HostWindowInfo(processID: 185, number: 3, ownerName: "Window Server", layer: cursorLayer,
+                                  bounds: CGRect(x: 1000, y: 800, width: 28, height: 40))
+        XCTAssertEqual(pick(point, moved, pointer: point, panels: [57], hit: 3).top?.number, 33)
     }
 
     func testAFocusedServiceActsForTheTargetOnlyOverItsWindow() {
