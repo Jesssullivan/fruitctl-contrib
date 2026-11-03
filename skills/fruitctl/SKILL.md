@@ -123,6 +123,14 @@ Each result carries a fresh readback frame; inspect it before the next step.
 take a new screenshot. `input_interrupted` reports how many events were posted
 before the stop; do not repeat the action blindly.
 
+To change a slider, text field, stepper or combo box, prefer
+`set_element_value {ref, value}` over dragging. Use the value the snapshot
+reports: a Logic plug-in slider holds a raw integer, such as 18 for a ratio
+shown as 2.1:1. `step_element {ref, steps}` performs `AXIncrement` for positive
+steps and `AXDecrement` for negative ones, up to 10. Read `value_after` and
+`verified` in the result. When `verified` is false the control did not take the
+value; take a new `ax_snapshot` before trying anything else.
+
 ## Computer-use alias
 
 `computer` accepts the Anthropic `computer` tool and OpenAI `computer_call`

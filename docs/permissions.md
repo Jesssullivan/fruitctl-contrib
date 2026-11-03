@@ -35,7 +35,10 @@ element cannot perform the action, the controller sends one VNC click at the
 element's centre through its ordinary input path. The Accessibility grant is
 expected on a standard Host install (D10). Without it, capture still works, and
 `ax_snapshot`, `click_element` and `focus_element` fail with the typed code
-`accessibility_permission_required`. The Host never prompts for a grant and
+`accessibility_permission_required`. With the input service on, the same grant
+lets `set_element_value` and `step_element` change one value control of the
+`hostInput` application through `AXValue`, `AXIncrement` or `AXDecrement`
+(#161). The Host never prompts for a grant and
 requests no microphone or Full Disk Access policy. VNC input remains with the
 controller and the target's Screen Sharing service.
 

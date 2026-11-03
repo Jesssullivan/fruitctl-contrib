@@ -27,6 +27,8 @@ enum HostAXActionKind: String {
 /// The single Accessibility call an action makes. Raw values are AX names.
 enum HostAXOperation: String {
     case press = "AXPress", showMenu = "AXShowMenu", raise = "AXRaise", focus = "AXFocused"
+    /// #161: only through ax_value, on an allowed value role.
+    case increment = "AXIncrement", decrement = "AXDecrement"
 
     var path: String {
         switch self {
@@ -34,6 +36,8 @@ enum HostAXOperation: String {
         case .showMenu: return "ax_show_menu"
         case .raise: return "ax_raise"
         case .focus: return "ax_focus"
+        case .increment: return "ax_increment"
+        case .decrement: return "ax_decrement"
         }
     }
 }
@@ -70,6 +74,8 @@ struct HostAXLiveState: Equatable {
     var frame: CGRect?
     var actions: [String] = []
     var focusSettable = false
+    /// AXValue is settable (#161). Never read for secure text.
+    var valueSettable = false
     var focused: Bool?
     var main: Bool?
     var selected: Bool?
@@ -170,9 +176,15 @@ struct HostAXGeneration {
 
     func resolve(_ request: HostAXActionRequest, sessionID: String, displayGeneration: UInt64,
                  geometry current: HostDisplayGeometry?) throws -> HostAXRetainedElement {
-        guard request.generation == number, sessionID == self.sessionID,
+        try resolve(generation: request.generation, ref: request.ref, sessionID: sessionID,
+                    displayGeneration: displayGeneration, geometry: current)
+    }
+
+    func resolve(generation requested: UInt64, ref: String, sessionID: String, displayGeneration: UInt64,
+                 geometry current: HostDisplayGeometry?) throws -> HostAXRetainedElement {
+        guard requested == number, sessionID == self.sessionID,
               displayGeneration == self.displayGeneration, current == geometry,
-              let element = elements[request.ref] else { throw HostAXActionError.staleRef }
+              let element = elements[ref] else { throw HostAXActionError.staleRef }
         return element
     }
 

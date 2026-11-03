@@ -220,6 +220,7 @@ targets:
       - FruitctlHost/HostAccessibility.swift
       - FruitctlHost/HostAccessibilityAction.swift
       - FruitctlHost/HostInput.swift
+      - FruitctlHost/HostAXValue.swift
       - Tests/FruitctlHostTests.swift
       - Tests/HostIdleReferenceTests.swift
       - Tests/HostSocketTests.swift
@@ -228,6 +229,7 @@ targets:
       - Tests/HostInputTests.swift
       - Tests/HostAXSubtreeTests.swift
       - Tests/HostCaptureScopeTests.swift
+      - Tests/HostAXValueTests.swift
     settings:
       base:
         ARCHS: arm64

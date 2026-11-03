@@ -57,10 +57,13 @@ const appBundle = () => z.string().regex(/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/).ma
 const commandRef = () => z.string()
   .regex(/^(?:[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}|ax:[0-9]{1,10}:0(?:\.[0-9]{1,3}){0,32})$/).max(128).optional()
   .describe('type_secret: operator-allowlisted secret name (never the secret itself); ' +
-    'click_element / focus_element: an element ref from the latest ax_snapshot');
+    'click_element / focus_element / set_element_value / step_element: an element ref from the latest ax_snapshot');
 
 const HOST_APP_ACTIONS = new Set(['mouse_click', 'mouse_double_click', 'triple_click', 'mouse_move', 'hover',
   'mouse_drag', 'scroll', 'key_tap', 'key_combo', 'key_type', 'activate_app']);
+// #161: Host route element value actions. They take app, never window.
+const HOST_VALUE_ACTIONS = new Set(['set_element_value', 'step_element']);
+const AX_REF_ACTIONS = new Set(['click_element', 'focus_element', 'show_menu_element', ...HOST_VALUE_ACTIONS]);
 
 export function validateActionParameters(input) {
   const required = {
@@ -72,12 +75,12 @@ export function validateActionParameters(input) {
     zoom: ['x', 'y', 'width', 'height'], wait_for_stable: ['stable_ms', 'timeout_ms'],
     expect_change: ['x', 'y', 'width', 'height'],
     click_element: ['ref'], focus_element: ['ref'], show_menu_element: ['ref'],
+    set_element_value: ['ref', 'value'], step_element: ['ref', 'steps'],
   }[input.action] || [];
   for (const field of required) {
     if (input[field] === undefined) throw new Error(`Missing ${field} for ${input.action}`);
   }
-  if (input.ref !== undefined && ['click_element', 'focus_element', 'show_menu_element'].includes(input.action) &&
-      !AX_ELEMENT_REF.test(input.ref)) {
+  if (input.ref !== undefined && AX_REF_ACTIONS.has(input.action) && !AX_ELEMENT_REF.test(input.ref)) {
     throw new Error(`${input.action} takes an element ref from ax_snapshot`);
   }
   if (input.action === 'type_secret' && input.ref !== undefined && !SECRET_NAME.test(input.ref)) {
@@ -104,7 +107,14 @@ export function validateActionParameters(input) {
   if (input.window !== undefined && !HOST_APP_ACTIONS.has(input.action)) {
     throw new Error(`window applies only to Host route input, not ${input.action}`);
   }
-  if (input.app !== undefined && !HOST_APP_ACTIONS.has(input.action)) {
+  if (input.value !== undefined && input.action !== 'set_element_value') {
+    throw new Error(`value applies only to set_element_value, not ${input.action}`);
+  }
+  if (input.steps !== undefined && input.action !== 'step_element') {
+    throw new Error(`steps applies only to step_element, not ${input.action}`);
+  }
+  if (input.action === 'step_element' && input.steps === 0) throw new Error('step_element steps must not be 0');
+  if (input.app !== undefined && !HOST_APP_ACTIONS.has(input.action) && !HOST_VALUE_ACTIONS.has(input.action)) {
     throw new Error(`app applies only to Host route input, not ${input.action}`);
   }
   if (input.modifiers !== undefined && input.action !== 'mouse_click') {
@@ -176,6 +186,10 @@ export function vncCommandTool() {
       '                                            ax_snapshot; result names the path and verified',
       '  focus_element  {ref}                    → Host route only: focus a ref (AXFocused)',
       '  show_menu_element {ref}                 → Host route only: open its menu or submenu (AXShowMenu)',
+      '  set_element_value {ref, value, app?}    → Host route with hostInput: set a slider, text field,',
+      '                                            incrementor or combo box value (AXValue); reads it back',
+      '  step_element   {ref, steps, app?}       → Host route with hostInput: AXIncrement (steps > 0) or',
+      '                                            AXDecrement (steps < 0), up to 10; reads the value back',
       '  ax_snapshot {root?, max_nodes?}         → root: focused_window, menu, or a ref, to read one subtree',
       '  activate_app   {app?}                   → Host route only: make the target app frontmost',
       'On a Host-only target with hostInput, FruitctlHost posts the pointer and key actions itself',
@@ -198,6 +212,7 @@ export function vncCommandTool() {
         'mouse_drag', 'scroll',
         'key_tap', 'key_combo', 'key_type', 'paste', 'type_secret', 'clipboard_read',
         'detect_elements', 'ax_snapshot', 'click_element', 'focus_element', 'show_menu_element', 'activate_app',
+        'set_element_value', 'step_element',
         'configure', 'get_timing',
         'wait', 'health', 'shutdown',
         'triple_click', 'cursor_position', 'hold_key', 'mouse_down', 'mouse_up',
@@ -218,6 +233,10 @@ export function vncCommandTool() {
       app: appBundle(),
       window: z.string().min(1).max(256).optional()
         .describe('Host route input: the focused window title the action requires'),
+      value: z.union([z.string().max(256), z.number().finite()]).optional()
+        .describe('set_element_value: the value; a number for a numeric control, as ax_snapshot reports it'),
+      steps: z.number().int().min(-10).max(10).optional()
+        .describe('step_element: AXIncrement count (positive) or AXDecrement count (negative)'),
       direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('Scroll direction'),
       amount: z.number().int().min(1).max(20).optional().describe('Scroll amount (default 3)'),
       ms: z.number().int().min(50).max(10000).optional().describe('Wait duration in ms (default 500)'),

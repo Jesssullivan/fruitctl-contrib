@@ -406,4 +406,113 @@ final class HostInputTests: XCTestCase {
         XCTAssertEqual(poster.posted.filter { if case .button(_, true, _, _, _) = $0 { return true }; return false }
                         .count, 1)
     }
+
+    // #172: the software cursor and plug-in host windows.
+    private let cursorLayer = Int(CGWindowLevelForKey(.cursorWindow))
+    private func logicWindows(cursorAt pointer: CGPoint) -> [HostWindowInfo] {
+        [HostWindowInfo(processID: 185, number: 3, ownerName: "Window Server", layer: cursorLayer,
+                        bounds: CGRect(x: pointer.x - 5, y: pointer.y - 5, width: 28, height: 40)),
+         HostWindowInfo(processID: 185, number: 4213, ownerName: "Window Server", name: "StatusIndicator",
+                        layer: cursorLayer, bounds: CGRect(x: 1610, y: 1, width: 28, height: 28)),
+         HostWindowInfo(processID: 34968, number: 5529, ownerName: "Fruitctl Host", layer: 25,
+                        bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024)),
+         HostWindowInfo(processID: 64374, number: 5757, ownerName: "Logic Pro", layer: 3,
+                        bounds: CGRect(x: 639, y: 285, width: 538, height: 996)),
+         HostWindowInfo(processID: 64374, number: 3514, ownerName: "Logic Pro", layer: 0,
+                        bounds: CGRect(x: 0, y: 30, width: 1637, height: 994))]
+    }
+
+    func testTheSoftwareCursorWindowIsLookedThroughAtThePointer() {
+        let ratio = CGPoint(x: 922, y: 497)
+        let windows = logicWindows(cursorAt: ratio)
+        let pick = HostInputWindowList.under(ratio, in: windows, pointer: ratio, ownProcess: 34968, ownPanels: [5529])
+        XCTAssertEqual(pick.top?.number, 5757)
+        XCTAssertEqual(pick.beneath?.number, 3514)
+        // The status indicator shares the cursor level but is named: it stays.
+        let indicator = CGPoint(x: 1620, y: 10)
+        XCTAssertEqual(HostInputWindowList.under(indicator, in: windows, pointer: ratio, ownProcess: 34968,
+                                                 ownPanels: [5529]).top?.number, 4213)
+        // A cursor-level window away from the pointer is not the cursor.
+        XCTAssertEqual(HostInputWindowList.under(ratio, in: windows, pointer: CGPoint(x: 10, y: 900),
+                                                 ownProcess: 34968, ownPanels: [5529]).top?.number, 3)
+        // Another process at the cursor level is never looked through.
+        var foreign = windows
+        foreign[0] = HostWindowInfo(processID: 524, number: 9, ownerName: "cmux", layer: cursorLayer,
+                                    bounds: windows[0].bounds)
+        XCTAssertEqual(HostInputWindowList.under(ratio, in: foreign, pointer: ratio, ownProcess: 34968,
+                                                 ownPanels: [5529]).top?.processID, 524)
+        // The Host's own windows other than its indicator panels stay.
+        XCTAssertEqual(HostInputWindowList.under(ratio, in: windows, pointer: ratio, ownProcess: 34968,
+                                                 ownPanels: []).top?.number, 5529)
+    }
+
+    func testAClickInAPluginWindowCompletesWhenTheCursorWindowAppears() async throws {
+        // neo, 2026-11-03: the start check passed, then the button-down
+        // check after the move saw the cursor window (input_window_mismatch
+        // after 1 event).
+        let poster = Poster()
+        let input = try request(["kind": .string("double_click"), "x": .integer(2), "y": .integer(2)])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        var reads = 0
+        let outcome = try await runner(poster, Monitor(), environment: { point, start in
+            reads += 1
+            guard let point else { return self.environment(front: 64374, window: nil) }
+            // Before the move the pointer is elsewhere; after it, the cursor
+            // window sits on the point.
+            let pointer = start ? CGPoint(x: 1500, y: 900) : point
+            let windows = [
+                HostWindowInfo(processID: 185, number: 3, ownerName: "Window Server", layer: self.cursorLayer,
+                               bounds: CGRect(x: pointer.x - 5, y: pointer.y - 5, width: 28, height: 40)),
+                HostWindowInfo(processID: 64374, number: 5757, ownerName: "Logic Pro", layer: 3,
+                               bounds: CGRect(x: 0, y: 0, width: 2000, height: 2000))]
+            let pick = HostInputWindowList.under(point, in: windows, pointer: pointer, ownProcess: 34968,
+                                                 ownPanels: [5529])
+            var value = self.environment(front: 64374, window: pick.top.map {
+                HostInputProcess(processID: $0.processID, bundleID: nil, executable: $0.ownerName) })
+            value.windowOwnerName = pick.top?.ownerName
+            value.windowLayer = pick.top?.layer
+            value.windowBeneathOwnerPID = pick.beneath?.processID
+            return value
+        }).run(input, steps: steps, lease: {})
+        XCTAssertTrue(outcome.completed, outcome.stopReason ?? "")
+        XCTAssertGreaterThan(reads, 2)
+    }
+
+    func testAPluginHostWindowActsForTheTargetOnlyOverTheTargetsWindow() throws {
+        let click = try request(["kind": .string("click"), "x": .integer(1), "y": .integer(1)])
+        func check(_ owner: HostInputProcess, beneath: pid_t?) throws {
+            var value = environment(window: owner)
+            value.windowBeneathOwnerPID = beneath
+            try HostInputGate.check(click, value, start: true, pointerCheck: true)
+        }
+        var service = HostInputProcess(processID: 95123, bundleID: nil, executable: "AUHostingServiceXPC_arrow")
+        service.parentProcessID = 1
+        service.appleCodeIdentifier = "com.apple.audio.AUHostingService.arm64e"
+        XCTAssertNoThrow(try check(service, beneath: 529))
+        // Over another application's window, or with nothing beneath.
+        XCTAssertThrowsError(try check(service, beneath: 524)) { XCTAssertEqual($0 as? HostInputError, .windowMismatch) }
+        XCTAssertThrowsError(try check(service, beneath: nil)) { XCTAssertEqual($0 as? HostInputError, .windowMismatch) }
+        // The same name without a valid Apple signature is not the service.
+        var unsigned = service
+        unsigned.appleCodeIdentifier = nil
+        XCTAssertThrowsError(try check(unsigned, beneath: 529))
+        // Another Apple-signed process is not enumerated.
+        var other = service
+        other.appleCodeIdentifier = "com.apple.controlcenter"
+        XCTAssertThrowsError(try check(other, beneath: 529))
+        // A child process of the target is admitted over its window only.
+        var child = HostInputProcess(processID: 700, bundleID: "com.example.plugin", executable: "PluginHost")
+        child.parentProcessID = 529
+        XCTAssertNoThrow(try check(child, beneath: 529))
+        XCTAssertThrowsError(try check(child, beneath: 524))
+        child.parentProcessID = 1
+        XCTAssertThrowsError(try check(child, beneath: 529))
+        // A consent dialog owner is refused whatever lies beneath it.
+        var agent = HostInputProcess(processID: 90, bundleID: nil, executable: "SecurityAgent")
+        agent.parentProcessID = 529
+        XCTAssertThrowsError(try check(agent, beneath: 529)) {
+            XCTAssertEqual(($0 as? HostAXActionError)?.rawValue, "human_consent_required")
+        }
+        XCTAssertFalse(HostPluginHosting.serves(service, target: 95123))
+    }
 }

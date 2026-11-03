@@ -431,13 +431,20 @@ on this route.
 | Live lease, fresh indicator heartbeat, unchanged display, no Stop | Host, before every event | the lease error ends the action |
 | `IsSecureEventInputEnabled`, or a focused secure text field | Host, before every event | `secure_input_active` |
 | Frontmost app is the target; optional pid and window title | Host, before every event | `input_target_mismatch` |
-| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. The Host's own status item and menu are refused | Host | `input_window_mismatch` |
+| Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. An AU hosting process for the target also qualifies when the target's own window lies directly beneath it (#172). The Host's own status item and menu are refused | Host | `input_window_mismatch` |
 | Key combinations macOS or the Dock handle: app and Space switching, Spotlight, input sources, force quit, lock, log out | Host | `input_system_shortcut` |
 | Typing needs a readable focused text input of the target. A newline or tab ends its request | Host | `input_focus_unavailable` |
 | Consent and authorization dialog owners | Host | `human_consent_required` |
 | Operator input: `yield` refuses or stops, `assert` continues and counts. `yield` needs a live event tap, and the keyboard tap for key and text input | Host | `operator_input_detected`, `operator_input_monitor_unavailable` |
 | The local Fruitctl menu is open | Host, every event | the action stops |
 | `activate_app` waits for 2 s of operator idle under either policy | Host | `operator_input_detected` |
+
+The window check looks through the Host's click-through indicator panels and the
+Window Server's software cursor. That cursor is an unnamed window at the cursor
+level, around the pointer. Once the pointer reaches the point, it is the topmost
+window there and receives no events (#172). An AU hosting process is an
+Apple-anchored `com.apple.audio.AUHostingService.arm64e` or `.x86-64`, or a
+child process of the target.
 
 A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
@@ -460,6 +467,23 @@ cannot tell operator keys from the Host's own during typing, so `yield` refuses
 key and text input without the keyboard tap. Qualification of the tap, timing and
 Space behaviour on a live desktop is an attended gate.
 
+
+### Element values
+
+`set_element_value {ref, value, app?}` sets one element's `AXValue`, and
+`step_element {ref, steps, app?}` performs `AXIncrement` or `AXDecrement` up to
+10 times (#161). They need the same `hostInput` policy, local opt-in, live
+lease, secure-input check, frontmost target and `yield` idle time as posted
+input. The element must be an `AXSlider`, `AXTextField`, `AXIncrementor` or
+`AXComboBox` that is enabled, with a settable value or the step action. Its
+owner must be the target or the target's AU hosting process. The Host sets a
+number for an element whose value is a number, and text otherwise. It then
+reads the value back within 250 milliseconds for a set and 120 milliseconds
+for each step. The reply carries `value_before`, `value_after`, `owner`,
+`steps_performed` and `verified`. A refusal before the first AX call keeps the
+lease. A step that changes nothing ends with `verified: false`. Operator input,
+Stop or a target change between steps ends the action as `input_interrupted`
+with the steps that ran. Nothing is retried.
 ## Host capture scope
 
 Host captures leave out windows the agent should not see (#163). A Host-only
