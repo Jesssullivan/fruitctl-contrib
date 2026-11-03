@@ -527,13 +527,22 @@ Space behaviour on a live desktop is an attended gate.
 `enter_element_value {ref, value, app?}` is for a control whose own value is not
 settable and which has an editable readout beside it, such as a Logic mixer fader
 (#181). `ref` names the readout, an `AXTextField` in the latest snapshot. The
-broker double-clicks its centre, types the number, presses Return and reads the
-readout back. `value` is at most 16 characters of a plain number in the readout's
-displayed unit. Each step is ordinary Host input, under every gate in the table
-above. The readback replaces the snapshot, so older refs go stale. A readout that
-does not show the number within its displayed decimals is `input_interrupted` with
-`reason: "value_not_verified"`. A stop after the field opened reports `entry_step`
-and leaves the field as it is.
+broker reads the readout's parent at depth 1 for its current frame, double-clicks
+its centre, types the number, presses Return and reads the parent again. `value` is
+at most 16 characters of a plain number in the readout's displayed unit. Each step
+is ordinary Host input, under every gate in the table above. Each read keeps only
+that parent's refs, so refs elsewhere go stale: one entry per strip, then a new
+snapshot.
+
+Logic reports no value on the readout and puts the figure in its label, as
+`volume fader level, -6.0 dB`. The entry is verified when that figure shows the number
+within its displayed decimals, or, when the readout shows no figure, when the
+sibling slider's value moved. `verified_by` says which. Anything else is
+`input_interrupted` with `reason: "value_not_verified"`, or the read's own refusal
+code, and the number may have been entered. A returned stop reports `entry_step` and
+leaves any open field as it is. A lost lease or a deadline retires the lane without
+naming a step, and the field may still be open. The Host gates do not prove the
+focused field is the readout, so check the readback frame after a first use.
 
 `set_element_value {ref, value, app?}` sets one element's `AXValue`, and
 `step_element {ref, steps, app?}` performs `AXIncrement` or `AXDecrement` up to

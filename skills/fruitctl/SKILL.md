@@ -149,9 +149,9 @@ A Logic mixer fader or send knob reports a value that is not settable, so
 `set_element_value` and `step_element` refuse with `ax_action_unsupported`. Use
 `enter_element_value {ref, value}` with the ref of its readout, the `AXTextField`
 such as `volume fader level`, and the number in dB. It double-clicks the readout,
-types the number, presses Return and reads the readout back. Take a new
-`ax_snapshot` afterwards to read the fader, because older refs are stale. Until
-that action is on your broker, send `mouse_double_click`, `key_type` and `key_tap`
+types the number, presses Return and reports `value_after`, `slider_before` and
+`slider_after`. Refs outside that strip go stale, so take a new `ax_snapshot`
+before the next strip. Until that action is on your broker, send `mouse_double_click`, `key_type` and `key_tap`
 `return` yourself. A knob without a readout takes `mouse_drag`.
 
 ## Computer-use alias
