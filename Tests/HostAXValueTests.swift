@@ -267,7 +267,7 @@ final class HostAXValueTests: XCTestCase {
             })
     }
 
-    private static func idle() -> HostInputEnvironment {
+    nonisolated private static func idle() -> HostInputEnvironment {
         var value = HostInputEnvironment(secureInput: false)
         value.frontmost = HostInputProcess(processID: 64374, bundleID: "com.apple.logic10", executable: "Logic Pro")
         value.operatorInputAge = 5_000
