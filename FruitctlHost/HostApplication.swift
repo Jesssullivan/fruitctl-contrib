@@ -87,12 +87,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private var activeInputSession: HostInputSession?
     /// The local Fruitctl menu is open: the operator is reaching for Stop.
     private var humanMenuOpen = false
-    /// #177: when the lease owner last sent a request other than a renewal.
-    /// A broker that keeps renewing for an agent that stopped is cut off at
-    /// `agentIdleMilliseconds`, above the broker's own 600 s maximum.
-    private var lastAgentRequestAt: UInt64?
-    private var agentIdleReleases = 0
-    static let agentIdleMilliseconds: UInt64 = 660_000
+    private var agentIdle = HostAgentIdleClock()
     private let inputPreferences: HostInputPreferences
     private let inputPoster = HostSystemInputPoster()
     private lazy var inputMonitor = HostOperatorInputMonitor(clock: { [clock] in clock.milliseconds() })
@@ -418,9 +413,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private func tick() {
         let now = clock.milliseconds()
         if lease.expire(at: now) { clearActivityUI() }
-        if lease.active != nil, let last = lastAgentRequestAt, now >= last &+ Self.agentIdleMilliseconds {
+        if agentIdle.cut(lease.active, at: now) {
             lease.invalidate(); clearActivityUI()
-            agentIdleReleases += 1
         }
         if lease.active != nil || idleReference.armedID != nil || idleReference.isExporting {
             if !activityEligible { invalidateActivity(reason: .activityUnavailable) }
@@ -588,7 +582,7 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         let agentRenewal = request.action == "renew_activity" && request.params["agent_request"] == .boolean(true)
         if response.success, Self.agentRequestActions.contains(request.action) || agentRenewal,
            lease.active?.connectionID == connectionID {
-            lastAgentRequestAt = clock.milliseconds()
+            agentIdle.noteRequest(at: clock.milliseconds())
         }
         return response
     }
@@ -633,8 +627,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 // Requests on one connection are answered as each completes.
                 status["request_pipelining"] = .boolean(true)
                 // #177: the Host's own bound on an activity with no agent request.
-                status["agent_idle_release_ms"] = .integer(Int64(Self.agentIdleMilliseconds))
-                status["agent_idle_releases"] = .integer(Int64(agentIdleReleases))
+                status["agent_idle_release_ms"] = .integer(Int64(HostAgentIdleClock.limitMilliseconds))
+                status["agent_idle_releases"] = .integer(Int64(agentIdle.releases))
                 // Capture and AX replies may be split with reply_part_bytes.
                 status["reply_parts"] = .boolean(true)
                 status["image_formats"] = .array([HostImageFormat.png, .jpeg].map { .string($0.rawValue) })
@@ -650,9 +644,9 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 let challenge = try request.requiredString("challenge")
                 try lease.begin(sessionID: session, connectionID: connectionID, sequence: sequence,
                                 challenge: challenge, displayGeneration: generation, now: now)
-                // #177: a new lease starts its own idle clock, before the snapshot
-                // below, so tick() never cuts it on an older lease's clock.
-                lastAgentRequestAt = now
+                // #177: before the snapshot below, so tick() never cuts this
+                // lease on an older lease's clock.
+                agentIdle.begin(at: now)
                 captureInProgress = true
                 defer { captureInProgress = false }
                 do {
@@ -685,6 +679,9 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                     if lease.release(connectionID: connectionID,
                                      sessionID: request.params["session_id"]?.string) { clearActivityUI() }
                     throw HostCaptureError.permissionRequired
+                }
+                if agentIdle.wasCut(sessionID: request.params["session_id"]?.string, connectionID: connectionID) {
+                    throw HostLeaseError.agentIdleReleased
                 }
                 try lease.renew(sessionID: request.requiredString("session_id"), connectionID: connectionID,
                     sequence: request.requiredSequence(), challenge: request.requiredString("challenge"),
