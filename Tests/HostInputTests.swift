@@ -690,4 +690,26 @@ final class HostInputTests: XCTestCase {
     }
 
     private func refusal(_ value: HostInputEnvironment) -> [String: HostValue] { HostInputGate.windowDetail(value) }
+
+    func testAnInterruptedModifierDragLiftsKeysBeforeEscape() async throws {
+        let poster = Poster()
+        let input = try request(["kind": .string("drag"), "x": .integer(10), "y": .integer(10),
+            "to_x": .integer(200), "to_y": .integer(100), "modifiers": .array([.string("cmd"), .string("alt")])])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        var session: HostInputSession?
+        var pauses = 0
+        session = runner(poster, Monitor(), environment: { _, _ in self.environment() }, onSleep: {
+            pauses += 1
+            // Stop lands while the drag is moving.
+            if pauses == 6 { _ = session?.releaseHeld() }
+        })
+        _ = try? await session!.run(input, steps: steps, lease: {})
+        let escape = try XCTUnwrap(poster.posted.firstIndex(of: .key(CGKeyCode(kVK_Escape), down: true, modifier: false,
+                                                                     flags: [])))
+        // Both held modifiers (Cmd and Option) are up before the Escape.
+        let upsBefore = poster.posted[..<escape].filter {
+            if case .key(_, false, true, _) = $0 { return true }; return false
+        }.count
+        XCTAssertEqual(upsBefore, 2)
+    }
 }

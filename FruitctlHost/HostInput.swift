@@ -863,6 +863,12 @@ final class HostInputSession {
         var released = 0
         let here = CGEvent(source: nil)?.location
         let escape = CGKeyCode(kVK_Escape)
+        // Keys first: the Escape that cancels a drag must never combine with a
+        // held modifier into a system shortcut such as Cmd+Option+Escape.
+        for key in heldKeys.reversed() {
+            if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
+        }
+        heldKeys.removeAll()
         for (button, origin) in heldButtons {
             if dragged.contains(button) {
                 if targetFrontmost() {
@@ -876,10 +882,7 @@ final class HostInputSession {
             }
         }
         dragged.removeAll()
-        for key in heldKeys.reversed() {
-            if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
-        }
-        heldButtons.removeAll(); heldKeys.removeAll()
+        heldButtons.removeAll()
         if released > 0 { monitor.notePosted(at: now()) }
         return released
     }
