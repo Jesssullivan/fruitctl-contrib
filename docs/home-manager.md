@@ -455,9 +455,11 @@ The profile renders only the fields the broker accepts on this route, so setting
 `vnc`, a credential, `secrets`, `daemonPath`, `input` or `clipboard` on it is an
 evaluation error. Host policy on a VNC profile is an evaluation error too.
 
-The broker refuses its whole configuration when a binding file is missing, which
-stops every target on that controller. Place the binding before the switch that
-first names it.
+The broker refuses its whole configuration when a binding file is missing or its
+directory is not private, which stops every target on that controller. Home
+Manager creates `Application Support/fruitctl` without tightening its mode, so
+set that directory to 0700 and place the binding before the switch that first
+names it.
 
 A Linux relay reaches the profile by name: declare `targets.desk = { }` there
 and run `fruitctl mcp --target desk`.

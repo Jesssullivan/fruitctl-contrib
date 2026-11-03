@@ -347,11 +347,13 @@ let
     && vncRouteUnset target
     && (target.hostHelper == null || target.hostHelper.mapping == null);
   hostInputValid = policy: policy == null || bundleList policy.applications;
-  hostCaptureValid = policy: policy == null || (
+  # Target scope needs applications of its own or from hostInput, as the executor does.
+  hostCaptureValid = target: let policy = target.hostCapture; in policy == null || (
     (policy.applications == null || bundleList policy.applications)
     && (policy.exclude == null || bundleList policy.exclude)
     && (policy.scope != "display" || policy.applications == null)
-    && (policy.scope == "display" || policy.exclude == null));
+    && (policy.scope == "display" || policy.exclude == null)
+    && (policy.scope != "target" || policy.applications != null || target.hostInput != null));
   hostIdleValid = value: value == null || value == 0 || (value >= 1000 && value <= 600000);
   sameUuid = left: right: if left == null || right == null then left == right else lib.toUpper left == lib.toUpper right;
 in {
@@ -464,7 +466,8 @@ in {
         { assertion = builtins.all (name: let helper = cfg.targets.${name}.hostHelper; in helper == null || (builtins.match "[a-zA-Z0-9][]a-zA-Z0-9_.@:[-]{0,255}" helper.sshHost != null && builtins.length helper.command == 2 && absolute (builtins.head helper.command) && builtins.match "[^[:cntrl:]]*" (builtins.head helper.command) != null && lib.hasSuffix "/FruitctlHost" (builtins.head helper.command) && builtins.elemAt helper.command 1 == "--stdio" && (helper.displayId != null || helper.displayUuid != null) && (helper.displayId == null || helper.displayId > 0) && (helper.displayUuid == null || displayUuid helper.displayUuid))) targetNames; message = "Fruitctl hostHelper requires an SSH alias, [ /absolute/path/FruitctlHost --stdio ] command and a positive displayId or a displayUuid."; }
         { assertion = builtins.all (name: let target = cfg.targets.${name}; in !hostOnly target || hostOnlyValid target) targetNames; message = "A Host-only Fruitctl target requires Darwin, a targetId and a Host binding with no VNC mapping, and forbids VNC, credential, secret, native-client, input and clipboard settings."; }
         { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostOnly target || hostPolicyUnset target) targetNames; message = "Fruitctl hostInput, hostCapture and hostActivityIdleMs require the Host-only transport."; }
-        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostInputValid target.hostInput && hostCaptureValid target.hostCapture && hostIdleValid target.hostActivityIdleMs) targetNames; message = "Fruitctl Host policy requires 1 to 16 unique bundle identifiers, display scope for exclude only, and hostActivityIdleMs of 0 or 1000 to 600000."; }
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostInputValid target.hostInput && hostCaptureValid target && hostIdleValid target.hostActivityIdleMs) targetNames; message = "Fruitctl Host policy requires 1 to 16 unique bundle identifiers, display scope for exclude only, applications for target scope, and hostActivityIdleMs of 0 or 1000 to 600000."; }
+        { assertion = let ids = lib.filter (id: id != null) (map (name: cfg.targets.${name}.targetId) targetNames); in lib.unique ids == ids; message = "Fruitctl targetId values must be unique: use one profile per desktop."; }
         { assertion = builtins.all (name: cfg.targets.${name}.clipboard.ttlMs == null || cfg.targets.${name}.clipboard.read) targetNames; message = "Fruitctl clipboard.ttlMs requires clipboard.read."; }
         { assertion = builtins.all (name: sshDestination cfg.targets.${name}.wake.ssh && sshDestination cfg.targets.${name}.desktopState.ssh) targetNames; message = "Fruitctl wake.ssh and desktopState.ssh must be explicit user@host destinations or SSH aliases, not options or shell text."; }
         { assertion = builtins.all (name: let helper = cfg.targets.${name}.hostHelper; mapping = if helper == null then null else helper.mapping; in mapping == null || (mapping.qualificationReceipt != "" && mapping.displayId == helper.displayId && sameUuid mapping.displayUuid helper.displayUuid && (mapping.scale == null || (mapping.scale >= 1 && mapping.scale <= 8)) && mapping.displayBounds.width > 0 && mapping.displayBounds.height > 0)) targetNames; message = "Fruitctl hostHelper mapping requires its qualification receipt, matching displayId/displayUuid, a scale within 1-8 when set, and positive display bounds."; }
