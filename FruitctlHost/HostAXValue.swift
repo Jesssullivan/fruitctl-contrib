@@ -192,7 +192,7 @@ enum HostAXValueVerifier {
     /// the broker's 2.4 s round trip.
     static let setBudgetNanoseconds: UInt64 = 250_000_000
     static let stepBudgetNanoseconds: UInt64 = 120_000_000
-    static let actionBudgetMilliseconds: UInt64 = 1_600
+    static let actionBudgetMilliseconds: UInt64 = 1_200
 
     /// set: the element reads the requested value. A step: the value changed,
     /// and a numeric value moved the way that was asked.
@@ -272,6 +272,8 @@ struct HostAXValueRunner {
         -> (verified: Bool, last: HostAXLiveRead)
 
     func run() async throws -> HostAXValueOutcome {
+        // The budget covers the first read too.
+        let started = now()
         let state: HostAXLiveState
         switch await liveState() {
         case .invalid: throw HostAXActionError.staleRef
@@ -283,7 +285,6 @@ struct HostAXValueRunner {
         var current = state
         var outcome = HostAXValueOutcome(request: request, owner: owner, role: state.role, before: state.value)
         outcome.after = state.value
-        let started = now()
         let count = request.operation == .set ? 1 : request.steps
         for index in 0..<count {
             if index == 0 {

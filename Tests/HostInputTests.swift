@@ -474,6 +474,10 @@ final class HostInputTests: XCTestCase {
         let other = HostWindowInfo(processID: 700, number: 8000, ownerName: "GarageBand", layer: 3,
                                    bounds: CGRect(x: 600, y: 300, width: 600, height: 400))
         XCTAssertEqual(pick(point, [view, plugin, main], pointer: nil).parent?.number, 5757)
+        // A window elsewhere on screen ordered between them does not separate them.
+        let elsewhere = HostWindowInfo(processID: 524, number: 9000, ownerName: "cmux", layer: 3,
+                                       bounds: CGRect(x: 1300, y: 600, width: 200, height: 200))
+        XCTAssertEqual(pick(point, [view, elsewhere, plugin, main], pointer: nil).parent?.number, 5757)
         // Another host's plug-in window directly below: its parent is not Logic.
         XCTAssertEqual(pick(point, [view, other, plugin, main], pointer: nil).parent?.processID, 700)
         // Logic's main window covers the point but is at another layer.

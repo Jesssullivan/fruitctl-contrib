@@ -497,7 +497,7 @@ the batch as `input_interrupted` with the calls that ran and the readback:
 - `value_unverified`: the value did not read back.
 - `ax_indeterminate`: a call may still act later.
 - `operator_input_detected`, Stop or a target change between steps.
-- `budget_exhausted`: no step starts after 1.6 seconds.
+- `budget_exhausted`: no step starts after 1.2 seconds, counted from the first read.
 
 `verified: false` can still mean the control changed, for example to a rounded
 value. Read `value_after` before acting again. When the lease itself ends after

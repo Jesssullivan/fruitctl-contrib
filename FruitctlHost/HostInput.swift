@@ -602,7 +602,8 @@ enum HostInputWindowList {
             return (nil, nil)
         }
         let top = windows[index]
-        let next = windows[(index + 1)...].first { !transparent($0) }
+        // Windows elsewhere on screen do not separate a view from its host.
+        let next = windows[(index + 1)...].first { !transparent($0) && $0.bounds.intersects(top.bounds) }
         guard let next, next.layer == top.layer,
               next.bounds.insetBy(dx: -1, dy: -1).contains(top.bounds) else { return (top, nil) }
         return (top, next)
