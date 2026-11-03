@@ -150,8 +150,11 @@ A Logic mixer fader or send knob reports a value that is not settable, so
 `enter_element_value {ref, value}` with the ref of its readout, the `AXTextField`
 such as `volume fader level`, and the number in dB. It double-clicks the readout,
 types the number, presses Return and reports `value_after`, `slider_before` and
-`slider_after`. Refs outside that strip go stale, so take a new `ax_snapshot`
-before the next strip. Until that action is on your broker, send `mouse_double_click`, `key_type` and `key_tap`
+`slider_after`. Check the readback frame the first time, because a missed
+double-click would type into whatever text field has focus. `value_not_verified`
+means the number may have gone in: some strips, such as Master and the buses, show
+no figure, so weigh `slider_moved` and do not repeat the entry blindly. Refs outside
+that strip go stale, so take a new `ax_snapshot` before the next strip. Until that action is on your broker, send `mouse_double_click`, `key_type` and `key_tap`
 `return` yourself. A knob without a readout takes `mouse_drag`.
 
 ## Computer-use alias

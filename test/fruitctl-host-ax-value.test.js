@@ -210,19 +210,22 @@ test('a lease lost after an AX call retires the lane with the count', async () =
 const STRIP = 'ax:77:0.0';
 const READOUT = `${STRIP}.1`;
 const FADER = `${STRIP}.0`;
+const NAME = `${STRIP}.2`;
 const WHOLE = { pid: 77, ref: 'ax:77:0', bundle_id: LOGIC, name: 'Logic Pro' };
 
-function stripNodes({ shown, raw, role, frame, readout = true }) {
+function stripNodes({ shown, raw, role, frame, readout = true, stripName = 'Bass Grit', slider = true }) {
   const root = { ref: STRIP, parent: null, depth: 0, role: 'AXGroup', frame: null };
-  return [root, { ref: FADER, parent: STRIP, depth: 1, role: 'AXSlider', label: 'volume fader', value: raw,
-    frame: { x: 100, y: 100, width: 20, height: 100 } },
+  return [root, ...(slider ? [{ ref: FADER, parent: STRIP, depth: 1, role: 'AXSlider', label: 'volume fader', value: raw,
+    frame: { x: 100, y: 100, width: 20, height: 100 } }] : []),
     ...(readout ? [{ ref: READOUT, parent: STRIP, depth: 1, role, frame,
-      label: shown === undefined ? 'volume fader level' : `volume fader level, ${shown}` }] : [])];
+      label: shown === undefined ? 'volume fader level' : `volume fader level, ${shown}` }] : []),
+    { ref: NAME, parent: STRIP, depth: 1, role: 'AXTextField', label: 'name', value: stripName,
+      frame: { x: 100, y: 20, width: 40, height: 20 } }];
 }
 
 const readoutHost = ({ shown = '-6.0 dB', raw = '113', role = 'AXTextField', answer, afterCommit = {},
   firstFrame = { x: 100, y: 50, width: 40, height: 20 }, liveFrame = { x: 200, y: 60, width: 40, height: 20 },
-  bundle = LOGIC, readRefusal } = {}) => {
+  bundle = LOGIC, readRefusal, shape = {} } = {}) => {
   let committed = false, reads = 0;
   return hostSequence({ capabilities: ['input', 'capture_scope', 'ax_value'], health: { input_enabled: true,
     input_post_permission: true, operator_input_monitor: 'event_tap' }, alter(request, response) {
@@ -237,9 +240,9 @@ const readoutHost = ({ shown = '-6.0 dB', raw = '113', role = 'AXTextField', ans
     if (request.action === 'ax_snapshot' && response.success) {
       reads += 1;
       if (committed && readRefusal) return refusal(request, readRefusal);
-      const nodes = reads === 1 ? stripNodes({ shown: '0.0 dB', raw: '90', role, frame: firstFrame })
-        : committed ? stripNodes({ shown, raw, role, frame: liveFrame, ...afterCommit })
-          : stripNodes({ shown: '0.0 dB', raw: '90', role, frame: liveFrame });
+      const nodes = reads === 1 ? stripNodes({ shown: '0.0 dB', raw: '90', role, frame: firstFrame, ...shape })
+        : committed ? stripNodes({ shown, raw, role, frame: liveFrame, ...shape, ...afterCommit })
+          : stripNodes({ shown: '0.0 dB', raw: '90', role, frame: liveFrame, ...shape });
       response.result.ax_snapshot = snapshot({ generation: 77, node_count: nodes.length, nodes,
         applications: [{ ...WHOLE, bundle_id: bundle }] });
     }
@@ -266,7 +269,7 @@ test('enter_element_value clicks the readout where it is now, then verifies the 
     assert.equal(response.error, undefined);
     const { ax_value: value } = response.result;
     assert.equal(value.verified, true);
-    assert.equal(value.verified_by, 'readout');
+    assert.equal(value.slider_moved, true);
     assert.equal(value.value_after, '-6.0 dB');
     assert.equal(value.value_requested, '-6');
     assert.deepEqual([value.slider_ref, value.slider_before, value.slider_after], [FADER, '90', '113']);
@@ -281,17 +284,54 @@ test('enter_element_value clicks the readout where it is now, then verifies the 
     assert.equal(captures(host) - before, 1);
     // Both reads ask for the strip, because the Host keeps refs under its root.
     const reads = host.requests.filter(request => request.action === 'ax_snapshot').slice(-2).map(request => request.params);
-    for (const read of reads) assert.deepEqual([read.root, read.depth], [STRIP, 1]);
+    for (const read of reads) assert.deepEqual([read.root, read.depth, read.max_nodes], [STRIP, 1, 256]);
     assert.ok(executor.axRefs.has(READOUT));
   } finally { await executor.close(); }
 });
 
-test('enter_element_value verifies by the slider when the readout shows no figure', async () => {
+test('a slider that moved does not verify an entry the readout cannot show', async () => {
   const { executor } = await entryExecutor({ afterCommit: { shown: undefined } });
   try {
     const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: -6 }]);
-    assert.equal(response.result.ax_value.verified_by, 'slider');
-    assert.equal(response.result.ax_value.value_after, null);
+    assert.equal(response.error.data.reason, 'value_not_verified');
+    assert.equal(response.error.data.verified, false);
+    assert.equal(response.error.data.slider_moved, true);
+    assert.equal(response.error.data.value_after, null);
+  } finally { await executor.close(); }
+});
+
+test('a strip name is not a readout, even a numeric one', async () => {
+  // Its label does not start with the fader's, so the fader is not its slider.
+  for (const [stripName, slider] of [['Bass Grit', true], ['808', true], ['808', false]]) {
+    const { executor, host } = await entryExecutor({ shape: { stripName, slider } });
+    try {
+      const [response] = await executor.execute([{ action: 'enter_element_value', ref: NAME, value: -6 }]);
+      assert.equal(response.error.data.code, 'ax_action_unsupported', stripName);
+      assert.deepEqual(inputs(host), []);
+    } finally { await executor.close(); }
+  }
+});
+
+test('the typing step stops once its time to ask again runs out', async () => {
+  const { executor, host } = await entryExecutor({ answer: request =>
+    (request.params.kind === 'type' ? refusal(request, 'input_focus_unavailable') : undefined) });
+  try {
+    const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: -6 }]);
+    assert.equal(response.error.data.code, 'input_focus_unavailable');
+    assert.equal(response.error.data.entry_step, 'type');
+    assert.ok(inputs(host).filter(params => params.kind === 'type').length <= 8);
+    assert.equal(inputs(host).some(params => params.kind === 'key'), false);
+  } finally { await executor.close(); }
+});
+
+test('the typing step asks again while the readout is still opening', async () => {
+  let refusals = 2;
+  const { executor, host } = await entryExecutor({ answer: request =>
+    (request.params.kind === 'type' && refusals-- > 0 ? refusal(request, 'input_focus_unavailable') : undefined) });
+  try {
+    const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: -6 }]);
+    assert.equal(response.error, undefined);
+    assert.deepEqual(inputs(host).map(params => params.kind), ['double_click', 'type', 'type', 'type', 'key']);
   } finally { await executor.close(); }
 });
 
@@ -333,10 +373,10 @@ test('enter_element_value names the step a refusal stopped', async () => {
   for (const [kind, step, kinds] of [['double_click', 'open', ['double_click']], ['type', 'type', ['double_click', 'type']],
     ['key', 'commit', ['double_click', 'type', 'key']]]) {
     const { executor, host } = await entryExecutor({ answer: request => (request.params.kind === kind
-      ? refusal(request, 'input_focus_unavailable') : undefined) });
+      ? refusal(request, 'input_target_mismatch') : undefined) });
     try {
       const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: '-6' }]);
-      assert.equal(response.error.data.code, 'input_focus_unavailable');
+      assert.equal(response.error.data.code, 'input_target_mismatch');
       assert.equal(response.error.data.entry_step, step);
       assert.deepEqual(inputs(host).map(params => params.kind), kinds);
     } finally { await executor.close(); }
@@ -379,11 +419,12 @@ test('enter_element_value refuses before admission what it cannot type or open',
   } finally { await other.executor.close(); }
 });
 
-test('enter_element_value does not click a readout the read just before no longer finds', async () => {
+test('enter_element_value does not click a readout with no frame on screen', async () => {
   const { executor, host } = await entryExecutor({ firstFrame: { x: 100, y: 50, width: 40, height: 20 }, liveFrame: null });
   try {
     const [response] = await executor.execute([{ action: 'enter_element_value', ref: READOUT, value: 1 }]);
-    assert.equal(response.error.data.code, 'stale_ref');
+    assert.equal(response.error.data.code, 'ax_action_unsupported');
+    assert.match(response.error.message, /frame/);
     assert.deepEqual(inputs(host), []);
   } finally { await executor.close(); }
 });

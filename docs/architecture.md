@@ -535,11 +535,17 @@ that parent's refs, so refs elsewhere go stale: one entry per strip, then a new
 snapshot.
 
 Logic reports no value on the readout and puts the figure in its label, as
-`volume fader level, -6.0 dB`. The entry is verified when that figure shows the number
-within its displayed decimals, or, when the readout shows no figure, when the
-sibling slider's value moved. `verified_by` says which. Anything else is
-`input_interrupted` with `reason: "value_not_verified"`, or the read's own refusal
-code, and the number may have been entered. A returned stop reports `entry_step` and
+`volume fader level, -6.0 dB`. A field that shows other text, such as a strip's
+name, refuses before input with `ax_action_unsupported`. The entry is verified only
+when the figure shows the number within its displayed decimals. Logic shows no
+figure on some strips, such as Master and the buses. There the result is
+`input_interrupted` with `reason: "value_not_verified"` and `slider_moved`, and the
+agent decides from `slider_before` and `slider_after`. A refused read keeps its own
+code as the reason. In every such case the number may have been entered.
+
+The broker waits 500 milliseconds after the double-click, and asks again for up to
+1.5 seconds while the Host refuses typing with `input_focus_unavailable`, which
+posts nothing. A returned stop reports `entry_step` and
 leaves any open field as it is. A lost lease or a deadline retires the lane without
 naming a step, and the field may still be open. The Host gates do not prove the
 focused field is the readout, so check the readback frame after a first use.
