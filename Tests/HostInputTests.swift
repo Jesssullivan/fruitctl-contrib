@@ -377,7 +377,7 @@ final class HostInputTests: XCTestCase {
                 (point?.x ?? 0) > 200 ? self.environment(window: finder) : self.environment()
             }).run(input, steps: steps, lease: {})
             XCTFail("expected a refusal")
-        } catch { XCTAssertEqual(error as? HostInputError, .windowMismatch) }
+        } catch { XCTAssertEqual((error as? HostInputRefusal)?.error, .windowMismatch) }
         XCTAssertTrue(poster.posted.isEmpty)
     }
 
@@ -599,9 +599,14 @@ final class HostInputTests: XCTestCase {
                                              geometry: geometry)
         XCTAssertThrowsError(try edges.check(dock, display: geometry.bounds))
         // A drag that passes through the corner on its way is refused too.
-        let drag = try HostInputPlanner.plan(request(["kind": .string("drag"), "x": .integer(400), "y": .integer(255),
-            "to_x": .integer(511), "to_y": .integer(200)]), geometry: geometry)
+        // From point (325.25, 127.75) to (355.75, 115.25): the end is just above
+        // the corner square, but the path crosses it.
+        let drag = try HostInputPlanner.plan(request(["kind": .string("drag"), "x": .integer(450), "y": .integer(255),
+            "to_x": .integer(511), "to_y": .integer(230)]), geometry: geometry)
         XCTAssertThrowsError(try edges.check(drag, display: geometry.bounds))
+        let endOnly = try HostInputPlanner.plan(request(["kind": .string("click"), "x": .integer(511), "y": .integer(230)]),
+                                                geometry: geometry)
+        XCTAssertNoThrow(try edges.check(endOnly, display: geometry.bounds))
         let inside = try HostInputPlanner.plan(request(["kind": .string("click"), "x": .integer(200), "y": .integer(100)]),
                                                geometry: geometry)
         XCTAssertNoThrow(try edges.check(inside, display: geometry.bounds))
