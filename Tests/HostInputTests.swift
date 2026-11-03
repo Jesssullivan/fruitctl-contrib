@@ -377,7 +377,7 @@ final class HostInputTests: XCTestCase {
                 (point?.x ?? 0) > 200 ? self.environment(window: finder) : self.environment()
             }).run(input, steps: steps, lease: {})
             XCTFail("expected a refusal")
-        } catch { XCTAssertEqual(error as? HostInputError, .windowMismatch) }
+        } catch { XCTAssertEqual((error as? HostInputRefusal)?.error, .windowMismatch) }
         XCTAssertTrue(poster.posted.isEmpty)
     }
 
@@ -572,5 +572,169 @@ final class HostInputTests: XCTestCase {
             XCTAssertEqual(($0 as? HostAXActionError)?.rawValue, "human_consent_required")
         }
         XCTAssertFalse(HostPluginHosting.serves(service, target: service))
+    }
+
+    // #178: hot corners and the auto-hidden Dock edge.
+    func testScreenEdgesReadDockPreferences() {
+        let edges = HostScreenEdges.from(cornerActions: [.topLeft: 0, .topRight: 1, .bottomLeft: 5, .bottomRight: 14],
+                                         dockOrientation: "left")
+        XCTAssertEqual(edges.corners, [.bottomLeft, .bottomRight])
+        XCTAssertEqual(edges.dockEdge, .left)
+        // Fail closed: an absent bottom-right key is the default Quick Note
+        // corner, an unreadable value is active, and the Dock edge always counts.
+        let defaults = HostScreenEdges.from(cornerActions: [:], dockOrientation: nil)
+        XCTAssertEqual(defaults.corners, [.bottomRight])
+        XCTAssertEqual(defaults.dockEdge, .bottom)
+        XCTAssertEqual(HostScreenEdges.from(cornerActions: [.topLeft: nil, .bottomRight: 0],
+                                            dockOrientation: "right").corners, [.topLeft])
+        XCTAssertEqual(HostScreenEdges.from(cornerActions: [:], dockOrientation: "sideways").dockEdge, .bottom)
+        let rects = edges.forbiddenRects(on: CGRect(x: 0, y: 0, width: 1637, height: 1024))
+        XCTAssertTrue(rects.contains(CGRect(x: 1625, y: 1012, width: 12, height: 12)))
+        XCTAssertTrue(rects.contains(CGRect(x: 0, y: 0, width: 4, height: 1024)))
+    }
+
+    func testThePointerNeverReachesAnActiveCornerOrTheDockEdge() throws {
+        let edges = HostScreenEdges(corners: [.bottomRight], dockEdge: .left)
+        // The test display is 256 by 128 points at x 100; pixel (511, 255) is its bottom-right corner.
+        let corner = try HostInputPlanner.plan(request(["kind": .string("click"), "x": .integer(511), "y": .integer(255)]),
+                                               geometry: geometry)
+        XCTAssertThrowsError(try edges.check(corner, display: geometry.bounds)) {
+            XCTAssertEqual($0 as? HostInputError, .screenEdge)
+        }
+        let dock = try HostInputPlanner.plan(request(["kind": .string("move"), "x": .integer(2), "y": .integer(100)]),
+                                             geometry: geometry)
+        XCTAssertThrowsError(try edges.check(dock, display: geometry.bounds))
+        // A drag that passes through the corner on its way is refused too.
+        // From point (325.25, 127.75) to (355.75, 115.25): the end is just above
+        // the corner square, but the path crosses it.
+        let drag = try HostInputPlanner.plan(request(["kind": .string("drag"), "x": .integer(450), "y": .integer(255),
+            "to_x": .integer(511), "to_y": .integer(230)]), geometry: geometry)
+        XCTAssertThrowsError(try edges.check(drag, display: geometry.bounds))
+        let endOnly = try HostInputPlanner.plan(request(["kind": .string("click"), "x": .integer(511), "y": .integer(230)]),
+                                                geometry: geometry)
+        XCTAssertNoThrow(try edges.check(endOnly, display: geometry.bounds))
+        let inside = try HostInputPlanner.plan(request(["kind": .string("click"), "x": .integer(200), "y": .integer(100)]),
+                                               geometry: geometry)
+        XCTAssertNoThrow(try edges.check(inside, display: geometry.bounds))
+        XCTAssertNoThrow(try HostScreenEdges.none.check(corner, display: geometry.bounds))
+        let keys = try HostInputPlanner.plan(request(["kind": .string("key"), "keys": .array([.string("escape")])]),
+                                             geometry: geometry)
+        XCTAssertNoThrow(try edges.check(keys, display: geometry.bounds))
+    }
+
+    // #179: focus held by the target's AU hosting process.
+    func testPluginFocusTakesKeysAndShortNumbers() throws {
+        var service = HostInputProcess(processID: 15776, bundleID: nil, executable: "AUHostingServiceXPC_arrow")
+        service.appleCodeIdentifier = "com.apple.audio.AUHostingService.arm64e"
+        var value = environment(window: nil)
+        value.focusOwner = service
+        value.focusIsText = false
+        let tune = try request(["kind": .string("type"), "text": .string("-0.22")])
+        XCTAssertNoThrow(try HostInputGate.check(tune, value, start: true, pointerCheck: false))
+        let words = try request(["kind": .string("type"), "text": .string("abc")])
+        XCTAssertThrowsError(try HostInputGate.check(words, value, start: true, pointerCheck: false)) {
+            XCTAssertEqual($0 as? HostInputError, .focusUnavailable)
+        }
+        let selectAll = try request(["kind": .string("key"), "keys": .array([.string("cmd"), .string("a")])])
+        XCTAssertNoThrow(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false))
+        // An unrelated process holding focus is still refused.
+        value.focusOwner = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
+        XCTAssertThrowsError(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false)) {
+            XCTAssertEqual($0 as? HostInputError, .targetMismatch)
+        }
+        // Inside the target's own process an unreadable focus still refuses typing.
+        value.focusOwner = HostInputProcess(processID: 529, bundleID: "com.apple.logic10", executable: "Logic Pro X")
+        XCTAssertThrowsError(try HostInputGate.check(tune, value, start: true, pointerCheck: false))
+        XCTAssertTrue(HostInputGate.numericEntry("+12,5"))
+        for bad in ["", "1e3", "12345678901234567", "1\n", " 1"] { XCTAssertFalse(HostInputGate.numericEntry(bad), bad) }
+    }
+
+    // #182: the refusing window travels with the refusal.
+    func testAWindowRefusalNamesTheWindow() async throws {
+        let poster = Poster()
+        let input = try request(["kind": .string("click"), "x": .integer(2), "y": .integer(2)])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        var cmux = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
+        cmux.appleCodeIdentifier = nil
+        var value = environment(window: cmux)
+        value.windowOwnerName = "cmux"
+        value.windowLayer = 0
+        value.windowBounds = CGRect(x: 10.4, y: 20, width: 300, height: 200.6)
+        do {
+            _ = try await runner(poster, Monitor(), environment: { _, _ in value }).run(input, steps: steps, lease: {})
+            XCTFail("expected a refusal")
+        } catch let refusal as HostInputRefusal {
+            XCTAssertEqual(refusal.error, .windowMismatch)
+            XCTAssertEqual(refusal.detail["schema"], .string("fruitctl.host-window-refusal.v1"))
+            XCTAssertEqual(refusal.detail["owner_pid"], .integer(524))
+            XCTAssertEqual(refusal.detail["owner_name"], .string("cmux"))
+            XCTAssertEqual(refusal.detail["owner_bundle_id"], .string("com.cmuxterm.app"))
+            XCTAssertEqual(refusal.detail["layer"], .integer(0))
+            XCTAssertEqual(refusal.detail["bounds"], .object(["x": .integer(10), "y": .integer(20),
+                                                             "width": .integer(300), "height": .integer(201)]))
+            XCTAssertEqual(refusal.detail["frontmost_pid"], .integer(529))
+        }
+        XCTAssertTrue(poster.posted.isEmpty)
+        // A window check that stops an action after the move reports it too.
+        var reads = 0
+        let outcome = try await runner(poster, Monitor(), environment: { _, _ in
+            reads += 1
+            return reads > 1 ? value : self.environment()
+        }).run(input, steps: steps, lease: {})
+        XCTAssertEqual(outcome.stopReason, "input_window_mismatch")
+        XCTAssertEqual(outcome.stopDetail?["owner_name"], .string("cmux"))
+        let metadata = outcome.metadata(input, frontmost: nil, monitor: "event_tap")
+        XCTAssertNotNil(metadata["stop_detail"])
+        // On the wire the detail is the error's data; a capture diagnostic is unchanged.
+        let line = try HostResponse.failure(id: .string("r1"), message: "input_window_mismatch",
+                                            detail: refusal(value)).line()
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: line) as? [String: Any])
+        let error = try XCTUnwrap(json["error"] as? [String: Any])
+        XCTAssertEqual((error["data"] as? [String: Any])?["owner_pid"] as? Int, 524)
+        let plain = try JSONSerialization.jsonObject(with: HostResponse.failure(id: .string("r2"), message: "x").line())
+        XCTAssertNil(((plain as? [String: Any])?["error"] as? [String: Any])?["data"])
+    }
+
+    private func refusal(_ value: HostInputEnvironment) -> [String: HostValue] { HostInputGate.windowDetail(value) }
+
+    func testAnInterruptedModifierDragLiftsKeysBeforeEscape() async throws {
+        let poster = Poster()
+        let input = try request(["kind": .string("drag"), "x": .integer(10), "y": .integer(10),
+            "to_x": .integer(200), "to_y": .integer(100), "modifiers": .array([.string("shift"), .string("rshift")])])
+        let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        var session: HostInputSession?
+        var pauses = 0
+        session = runner(poster, Monitor(), environment: { _, _ in self.environment() }, onSleep: {
+            pauses += 1
+            // Stop lands while the drag is moving.
+            if pauses == 6 { _ = session?.releaseHeld() }
+        })
+        _ = try? await session!.run(input, steps: steps, lease: {})
+        let escape = try XCTUnwrap(poster.posted.firstIndex(of: .key(CGKeyCode(kVK_Escape), down: true, modifier: false,
+                                                                     flags: [])))
+        // Both held modifiers are up before the Escape.
+        let upsBefore = poster.posted[..<escape].filter {
+            if case .key(_, false, true, _) = $0 { return true }; return false
+        }.count
+        XCTAssertEqual(upsBefore, 2)
+    }
+
+    func testTheHostTakesShiftOnlyOnDragsAndBoundsTheDetail() throws {
+        XCTAssertNoThrow(try request(["kind": .string("drag"), "x": .integer(1), "y": .integer(1), "to_x": .integer(2),
+                                      "to_y": .integer(2), "modifiers": .array([.string("shift")])]))
+        for name in ["cmd", "alt", "ctrl"] {
+            XCTAssertThrowsError(try request(["kind": .string("drag"), "x": .integer(1), "y": .integer(1),
+                "to_x": .integer(2), "to_y": .integer(2), "modifiers": .array([.string("shift"), .string(name)])]), name)
+        }
+        XCTAssertNoThrow(try request(["kind": .string("click"), "x": .integer(1), "y": .integer(1),
+                                      "modifiers": .array([.string("cmd")])]))
+        var value = environment(window: HostInputProcess(processID: 9, bundleID: "a..b", executable: "x"))
+        value.windowOwnerName = String(repeating: "\u{1F600}", count: 40)
+        value.windowBounds = .null
+        let detail = HostInputGate.windowDetail(value)
+        XCTAssertEqual(detail["owner_bundle_id"], .null)
+        if case .string(let name)? = detail["owner_name"] { XCTAssertLessThanOrEqual(name.utf16.count, 64) }
+        else { XCTFail("owner_name missing") }
+        XCTAssertNil(detail["bounds"])
     }
 }

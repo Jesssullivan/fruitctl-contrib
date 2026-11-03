@@ -221,6 +221,7 @@ targets:
       - FruitctlHost/HostAccessibilityAction.swift
       - FruitctlHost/HostInput.swift
       - FruitctlHost/HostAXValue.swift
+      - FruitctlHost/HostScreenEdges.swift
       - Tests/FruitctlHostTests.swift
       - Tests/HostIdleReferenceTests.swift
       - Tests/HostSocketTests.swift

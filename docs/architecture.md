@@ -443,7 +443,8 @@ one point is up to the plug-in; check the readback frame. The VNC route refuses 
 | Frontmost app is the target; optional pid and window title | Host, before every event | `input_target_mismatch` |
 | Window under each press and each drop belongs to the target, its Save or Open panel, or the menu bar outside the Apple menu. An AU hosting process for the target also qualifies when the target's own window lies directly beneath it (#172). The Host's own status item and menu are refused | Host | `input_window_mismatch` |
 | Key combinations macOS or the Dock handle: app and Space switching, Spotlight, input sources, force quit, lock, log out | Host | `input_system_shortcut` |
-| Typing needs a readable focused text input of the target. A newline or tab ends its request | Host | `input_focus_unavailable` |
+| No pointer position, including every point of a drag, within 12 points of an active hot corner or within 4 points of the Dock's edge (#178). A corner is active when `com.apple.dock` `wvous-*-corner` is above 1 or unreadable; an absent bottom-right key is macOS's default Quick Note. The Dock's edge counts whether or not it hides, because a full-screen window reveals it | Host, before the first event | `input_screen_edge` |
+| Typing needs a readable focused text input of the target. A newline or tab ends its request. Focus held by the target's AU hosting process (an out-of-process plug-in view) admits keys, and admits typing of 1 to 16 digits, signs, points or commas into a field AX cannot read (#179). Those characters are also Logic key commands (screensets, transport), as with `key_tap`: click into the field first and check the readback frame | Host | `input_focus_unavailable` |
 | Consent and authorization dialog owners | Host | `human_consent_required` |
 | Operator input: `yield` refuses or stops, `assert` continues and counts. `yield` needs a live event tap, and the keyboard tap for key and text input | Host | `operator_input_detected`, `operator_input_monitor_unavailable` |
 | The local Fruitctl menu is open | Host, every event | the action stops |
@@ -465,6 +466,13 @@ the window directly below it in front-to-back order is the target's, at the
 same layer, and contains it. A remote view is ordered that way over its host's
 window. Logic's main window, at another layer, does not qualify.
 
+`input_window_mismatch` names the window that refused it (#182), as `window` in
+the refusal's data, and in `input_interrupted` when it stopped an action. It
+carries the owner's pid, process name, bundle ID and Apple signing ID, whether
+it is the Window Server, the window's level and bounds in points, the owner of
+the window directly below it, and the frontmost pid. It never carries a title
+or pixels.
+
 A refusal before the first event keeps the lease and is that action's error
 response. A stop after some events releases every button and key the Host
 pressed, then reports `input_interrupted` with the count it posted and a
@@ -483,7 +491,9 @@ refs) 10 s after the agent's last request ends (#177). The lane keeps its owner
 and executor. The next request begins a new activity, which takes about half a
 second, so refs from before the gap are stale: take a new `ax_snapshot`. The
 target profile's `hostActivityIdleMs` sets the period: 0 keeps the activity
-until the lane releases, otherwise 1000 to 600000 ms. When the agent's broker
+until the lane releases, otherwise 1000 to 600000 ms. FruitctlHost itself ends
+an activity whose owner sends no agent request for 660 s; every broker batch
+counts, through a marked renewal when the batch does not reach the Host. When the agent's broker
 connection closes, the lane releases at once, through the same path as a
 `close` frame. Before this, a stalled or vanished agent kept the indicator up
 until the 60 s owner lease ended. A VNC target keeps its activity for the lane's
@@ -610,6 +620,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `operator_input_monitor_unavailable` | Host | `yield` with key or text input needs an event tap that sees keys (Input Monitoring) |
 | `input_focus_unavailable` | Host | Typing needs a readable focused text input owned by the target |
 | `input_system_shortcut` | Host | The key combination belongs to macOS or the Dock, not the target |
+| `input_screen_edge` | Host | The pointer would reach an active hot corner or the auto-hidden Dock's edge; nothing was sent |
 | `input_interrupted` | Host route | A Host input action stopped after posting some events; `data.reason`, `data.posted_events` |
 | `reconcile_refused` | broker | `fruitctl reconcile` found the lane closing, busy or changed |
 | `reconcile_unsupported` | broker | The latched lane cannot prove its own release; restart the reconciled broker |

@@ -27,6 +27,17 @@ enum HostInputError: String, Error {
     case focusUnavailable = "input_focus_unavailable"
     /// The key combination is handled by the system, not the target.
     case systemShortcut = "input_system_shortcut"
+    /// #178: the pointer would reach an active hot corner or the auto-hidden
+    /// Dock's reveal edge, where the system acts before the target.
+    case screenEdge = "input_screen_edge"
+}
+
+/// A refusal before the first event that names what refused it (#182).
+struct HostInputRefusal: Error {
+    let error: HostInputError
+    /// Schema `fruitctl.host-window-refusal.v1`: system facts about the
+    /// window under the pointer, never its title or pixels.
+    let detail: [String: HostValue]
 }
 
 enum HostInputKind: String, CaseIterable {
@@ -196,6 +207,9 @@ struct HostInputRequest: Equatable {
                       !modifiers.contains(where: { $0.code == modifier.code }) else { throw invalid }
                 modifiers.append(modifier)
             }
+            // #180: a drag holds Shift only. Cmd, Ctrl and Option turn it into
+            // another command; the Host enforces this as well as the broker.
+            if kind == .drag, modifiers.contains(where: { $0.flag != .maskShift }) { throw invalid }
         }
         var dx: Int32 = 0, dy: Int32 = 0
         if kind == .scroll {
@@ -622,6 +636,8 @@ struct HostInputEnvironment: Equatable {
     var windowLayer: Int?
     /// The Window Server, verified by its signature, owns that window.
     var windowOwnerIsWindowServer = false
+    /// That window's level and bounds in global points (#182).
+    var windowBounds: CGRect?
     /// The owner of the window directly below it that contains it at the
     /// same layer (#172); nil when there is none.
     var windowParentOwnerPID: pid_t?
@@ -670,6 +686,52 @@ enum HostInputGate {
     }
 
     static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+    /// #179: 1 to 16 characters of digits, sign, decimal point or comma.
+    static func numericEntry(_ text: String) -> Bool {
+        !text.isEmpty && text.count <= 16 && text.unicodeScalars.allSatisfy {
+            ($0.value >= 48 && $0.value <= 57) || $0 == "-" || $0 == "+" || $0 == "." || $0 == ","
+        }
+    }
+
+    /// #182: what the window under the pointer is, for a refusal. Process
+    /// name and identifiers, level and bounds; never the window's title.
+    static func windowDetail(_ environment: HostInputEnvironment) -> [String: HostValue] {
+        // UTF-16 units, as the broker counts them; never a broken surrogate pair.
+        func text(_ value: String?, _ limit: Int) -> HostValue {
+            guard let value else { return .null }
+            var clean = ""
+            for character in value where character.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) {
+                guard clean.utf16.count + String(character).utf16.count <= limit else { break }
+                clean.append(character)
+            }
+            return .string(clean)
+        }
+        func identifier(_ value: String?) -> HostValue {
+            guard let value, HostInputTarget.validBundle(value), !value.contains("..") else { return .null }
+            return .string(value)
+        }
+        var detail: [String: HostValue] = ["schema": .string("fruitctl.host-window-refusal.v1")]
+        if let owner = environment.windowOwner {
+            detail["owner_pid"] = .integer(Int64(owner.processID))
+            detail["owner_name"] = text(environment.windowOwnerName ?? owner.executable, 64)
+            detail["owner_bundle_id"] = identifier(owner.bundleID)
+            detail["owner_code_id"] = identifier(owner.appleCodeIdentifier)
+        } else {
+            detail["owner_pid"] = .null
+        }
+        detail["window_server"] = .boolean(environment.windowOwnerIsWindowServer)
+        detail["layer"] = environment.windowLayer.map { .integer(Int64(clamping: $0)) } ?? .null
+        if let bounds = environment.windowBounds, !bounds.isNull, !bounds.isInfinite,
+           let x = Int64(exactly: bounds.minX.rounded()), let y = Int64(exactly: bounds.minY.rounded()),
+           let width = Int64(exactly: bounds.width.rounded()), let height = Int64(exactly: bounds.height.rounded()) {
+            detail["bounds"] = .object(["x": .integer(x), "y": .integer(y), "width": .integer(width),
+                                        "height": .integer(height)])
+        }
+        detail["parent_owner_pid"] = environment.windowParentOwnerPID.map { .integer(Int64($0)) } ?? .null
+        detail["frontmost_pid"] = environment.frontmost.map { .integer(Int64($0.processID)) } ?? .null
+        return detail
+    }
     /// Activation takes the keyboard from the operator whatever the policy.
     static let activationIdleMilliseconds: UInt64 = 2_000
 
@@ -712,13 +774,22 @@ enum HostInputGate {
         }
         if start, !request.kind.pointer {
             if environment.focusSecure { throw HostInputError.secureInput }
+            // #179: an AU view drawn out of process (Kontakt) holds focus in
+            // the target's AU hosting service.
+            let pluginFocus = environment.focusOwner.map { HostPluginHosting.serves($0, target: frontmost) } ?? false
             if let owner = environment.focusOwner, owner.processID != frontmost.processID,
-               owner.bundleID.map(panelServices.contains) != true {
+               owner.bundleID.map(panelServices.contains) != true, !pluginFocus {
                 throw HostInputError.targetMismatch
             }
             // Typing needs a readable text input; an unreadable or non-text
             // focus would turn characters into the target's key commands.
-            if request.kind == .type, environment.focusOwner == nil || !environment.focusIsText {
+            // A plug-in's own value field is not readable through AX, so it may
+            // take a short number only. Digits, signs and points are key
+            // commands in Logic too (screensets, transport), exactly as a
+            // key_tap of them already is; the agent clicks into the field first
+            // and checks the readback frame.
+            if request.kind == .type, environment.focusOwner == nil
+                || !(environment.focusIsText || (pluginFocus && numericEntry(request.text ?? ""))) {
                 throw HostInputError.focusUnavailable
             }
         }
@@ -767,6 +838,8 @@ final class HostInputSession {
         var stopReason: String?
         var operatorEvents = 0
         var released = 0
+        /// #182: the refusing window when a window check stopped the action.
+        var stopDetail: [String: HostValue]?
     }
 
     typealias Check = @MainActor () throws -> Void
@@ -807,6 +880,12 @@ final class HostInputSession {
         var released = 0
         let here = CGEvent(source: nil)?.location
         let escape = CGKeyCode(kVK_Escape)
+        // Keys first: the Escape that cancels a drag must never combine with a
+        // held modifier into a system shortcut such as Cmd+Option+Escape.
+        for key in heldKeys.reversed() {
+            if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
+        }
+        heldKeys.removeAll()
         for (button, origin) in heldButtons {
             if dragged.contains(button) {
                 if targetFrontmost() {
@@ -820,10 +899,7 @@ final class HostInputSession {
             }
         }
         dragged.removeAll()
-        for key in heldKeys.reversed() {
-            if poster.post(.key(key.code, down: false, modifier: key.modifier, flags: [])) { released += 1 }
-        }
-        heldButtons.removeAll(); heldKeys.removeAll()
+        heldButtons.removeAll()
         if released > 0 { monitor.notePosted(at: now()) }
         return released
     }
@@ -838,12 +914,15 @@ final class HostInputSession {
         }.last : nil
         // Refusals before the first event keep the lease (typed errors).
         try lease()
-        try HostInputGate.check(request, environment(firstPoint, true), start: true, pointerCheck: firstPoint != nil,
-                                point: firstPoint)
-        if let dropPoint {
-            try HostInputGate.check(request, environment(dropPoint, false), start: false, pointerCheck: true,
-                                    point: dropPoint)
+        func checked(_ value: HostInputEnvironment, start: Bool, pointer: CGPoint?) throws {
+            do {
+                try HostInputGate.check(request, value, start: start, pointerCheck: pointer != nil, point: pointer)
+            } catch HostInputError.windowMismatch {
+                throw HostInputRefusal(error: .windowMismatch, detail: HostInputGate.windowDetail(value))
+            }
         }
+        try checked(environment(firstPoint, true), start: true, pointer: firstPoint)
+        if let dropPoint { try checked(environment(dropPoint, false), start: false, pointer: dropPoint) }
         let started = now()
         var sampledAt: UInt64?
         var outcome = Outcome()
@@ -863,8 +942,14 @@ final class HostInputSession {
                     if case .button(_, true, let at, _, _) = step, heldButtons.isEmpty { pointer = at }
                     // A drop is re-checked where it lands before the button-up.
                     if case .button(_, false, let at, _, _) = step, request.kind == .drag { pointer = at }
-                    try HostInputGate.check(request, environment(pointer, false), start: false,
-                                            pointerCheck: pointer != nil, point: pointer)
+                    let value = environment(pointer, false)
+                    do {
+                        try HostInputGate.check(request, value, start: false, pointerCheck: pointer != nil,
+                                                point: pointer)
+                    } catch HostInputError.windowMismatch {
+                        outcome.stopDetail = HostInputGate.windowDetail(value)
+                        throw HostInputError.windowMismatch
+                    }
                 }
             } catch let error as HostInputError {
                 stop(error.rawValue); return outcome
@@ -1128,6 +1213,7 @@ enum HostSystemInputEnvironment {
                 environment.windowOwnerIsWindowServer = top.ownerName == HostInputGate.windowServer
                     && isWindowServer(top.processID)
                 environment.windowParentOwnerPID = parent?.processID
+                environment.windowBounds = top.bounds
             }
             if environment.windowOwnerName == HostInputGate.windowServer, let front = environment.frontmost,
                let bar = element(AXUIElementCreateApplication(front.processID), kAXMenuBarAttribute),
@@ -1142,7 +1228,11 @@ enum HostSystemInputEnvironment {
                CFGetTypeID(focused) == AXUIElementGetTypeID() {
                 let element = focused as! AXUIElement
                 var pid: pid_t = 0
-                if AXUIElementGetPid(element, &pid) == .success, pid > 0 { environment.focusOwner = process(pid) }
+                if AXUIElementGetPid(element, &pid) == .success, pid > 0 {
+                    // Another process's focus needs the plug-in host reads (#179).
+                    environment.focusOwner = pid == environment.frontmost?.processID ? process(pid)
+                        : HostProcessIdentity.describe(process(pid))
+                }
                 var role: AnyObject?, subrole: AnyObject?
                 _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
                 _ = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
@@ -1229,6 +1319,7 @@ extension HostInputSession.Outcome {
             "operator_input_events": .integer(Int64(operatorEvents)), "operator_input_monitor": .string(monitor),
             "released_events": .integer(Int64(released)), "target_bundle_id": .string(request.target.bundleID)]
         if let stopReason { result["stop_reason"] = .string(stopReason) }
+        if let stopDetail { result["stop_detail"] = .object(stopDetail) }
         if let frontmost {
             result["frontmost_pid"] = .integer(Int64(frontmost.processID))
             result["frontmost_bundle_id"] = frontmost.bundleID.map { .string($0) } ?? .null
