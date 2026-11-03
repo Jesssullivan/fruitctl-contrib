@@ -585,7 +585,7 @@ final class HostInputTests: XCTestCase {
         let defaults = HostScreenEdges.from(cornerActions: [:], dockOrientation: nil)
         XCTAssertEqual(defaults.corners, [.bottomRight])
         XCTAssertEqual(defaults.dockEdge, .bottom)
-        XCTAssertEqual(HostScreenEdges.from(cornerActions: [.topLeft: .some(nil), .bottomRight: 0],
+        XCTAssertEqual(HostScreenEdges.from(cornerActions: [.topLeft: nil, .bottomRight: 0],
                                             dockOrientation: "right").corners, [.topLeft])
         XCTAssertEqual(HostScreenEdges.from(cornerActions: [:], dockOrientation: "sideways").dockEdge, .bottom)
         let rects = edges.forbiddenRects(on: CGRect(x: 0, y: 0, width: 1637, height: 1024))
@@ -700,7 +700,7 @@ final class HostInputTests: XCTestCase {
     func testAnInterruptedModifierDragLiftsKeysBeforeEscape() async throws {
         let poster = Poster()
         let input = try request(["kind": .string("drag"), "x": .integer(10), "y": .integer(10),
-            "to_x": .integer(200), "to_y": .integer(100), "modifiers": .array([.string("cmd"), .string("alt")])])
+            "to_x": .integer(200), "to_y": .integer(100), "modifiers": .array([.string("shift"), .string("rshift")])])
         let steps = try HostInputPlanner.plan(input, geometry: geometry)
         var session: HostInputSession?
         var pauses = 0
@@ -712,7 +712,7 @@ final class HostInputTests: XCTestCase {
         _ = try? await session!.run(input, steps: steps, lease: {})
         let escape = try XCTUnwrap(poster.posted.firstIndex(of: .key(CGKeyCode(kVK_Escape), down: true, modifier: false,
                                                                      flags: [])))
-        // Both held modifiers (Cmd and Option) are up before the Escape.
+        // Both held modifiers are up before the Escape.
         let upsBefore = poster.posted[..<escape].filter {
             if case .key(_, false, true, _) = $0 { return true }; return false
         }.count

@@ -491,7 +491,9 @@ refs) 10 s after the agent's last request ends (#177). The lane keeps its owner
 and executor. The next request begins a new activity, which takes about half a
 second, so refs from before the gap are stale: take a new `ax_snapshot`. The
 target profile's `hostActivityIdleMs` sets the period: 0 keeps the activity
-until the lane releases, otherwise 1000 to 600000 ms. When the agent's broker
+until the lane releases, otherwise 1000 to 600000 ms. FruitctlHost itself ends
+an activity whose owner sends no agent request for 660 s; every broker batch
+counts, through a marked renewal when the batch does not reach the Host. When the agent's broker
 connection closes, the lane releases at once, through the same path as a
 `close` frame. Before this, a stalled or vanished agent kept the indicator up
 until the 60 s owner lease ended. A VNC target keeps its activity for the lane's

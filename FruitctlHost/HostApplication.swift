@@ -650,6 +650,9 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 let challenge = try request.requiredString("challenge")
                 try lease.begin(sessionID: session, connectionID: connectionID, sequence: sequence,
                                 challenge: challenge, displayGeneration: generation, now: now)
+                // #177: a new lease starts its own idle clock, before the snapshot
+                // below, so tick() never cuts it on an older lease's clock.
+                lastAgentRequestAt = now
                 captureInProgress = true
                 defer { captureInProgress = false }
                 do {
