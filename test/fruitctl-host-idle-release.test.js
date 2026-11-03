@@ -195,11 +195,11 @@ test('a refused request re-arms the idle period, and health checks do not hold i
     await executor.execute([{ action: 'screenshot' }]);
     await assert.rejects(executor.execute([{ action: 'mouse_drag', x: 1, y: 1, fine_dx: 99 }]),
       error => isPreAdmissionRefusal(error));
-    for (let index = 0; index < 4; index++) {
+    // Health every 30 ms for 300 ms: the release still happens while polling.
+    for (let index = 0; index < 10; index++) {
       await executor.execute([{ action: 'health' }]);
       await delay(30);
     }
-    await delay(150);
     assert.equal(count(host, 'release_activity'), 1);
   } finally { await executor.close().catch(() => {}); }
 });
@@ -244,5 +244,19 @@ test('another session on the Host after an idle release is a per-call host_busy,
     assert.equal(executor.failed, undefined);
     await executor.release();
     assert.equal(executor.failed, undefined);
+  } finally { await executor.close().catch(() => {}); }
+});
+
+test('without an idle release, release still requires the Host to show no live lease', async () => {
+  const { executor } = await executorFor({ idle: 0, alter(request, response) {
+    if (request.action === 'health' && response.result.lease_remaining_ms === 0) {
+      Object.assign(response.result, { session_id: request.params?.session_id ?? response.result.session_id,
+        ready: true, lease_remaining_ms: 2500 });
+    }
+    return response;
+  } });
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    await assert.rejects(executor.release(), /release unconfirmed|release_unconfirmed|Host-helper/);
   } finally { await executor.close().catch(() => {}); }
 });

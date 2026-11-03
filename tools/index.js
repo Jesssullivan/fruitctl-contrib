@@ -22,7 +22,7 @@ const button = () => z.enum(['left', 'right', 'middle']).optional().describe('Mo
 const MODIFIERS = ['shift', 'rshift', 'ctrl', 'rctrl', 'alt', 'option', 'ralt', 'cmd', 'command', 'rcmd'];
 const MODIFIER_ALIASES = { option: 'alt', command: 'cmd' };
 const modifiers = () => z.array(z.enum(MODIFIERS)).min(1).max(MODIFIERS.length).optional()
-  .describe('mouse_click, or mouse_drag on the Host route: modifier keys held around it (e.g. ["shift"] or ["cmd"])');
+  .describe('mouse_click: modifier keys held around the click (e.g. ["cmd"]); mouse_drag on the Host route: ["shift"] only');
 const durationMs = () => z.number().int().min(1).max(10000).optional()
   .describe('hold_key duration in ms; the key is released before the call returns');
 

@@ -423,9 +423,9 @@ plug-in's fine mode (#180). Other modifiers are refused: they turn a drag into
 another command, and with Escape, which cancels an interrupted drag, they can
 form a system shortcut. Instead of `toX` and `toY` a drag can take `fine_dx`
 and `fine_dy`: the end as an offset from the start in framebuffer pixels, from
--64 to 64, not both zero. Whether a plug-in reads a movement under one point is
-up to the plug-in; check the readback frame. On a 2x display one framebuffer pixel is half a point,
-finer than one screenshot pixel. The VNC route refuses both with
+-64 to 64, not both zero. On a 2x display one framebuffer pixel is half a
+point, finer than one screenshot pixel. Whether a plug-in reads a movement under
+one point is up to the plug-in; check the readback frame. The VNC route refuses both with
 `unsupported_on_route`, because its daemon takes modifiers only on clicks.
 
 ```json
