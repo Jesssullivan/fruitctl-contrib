@@ -123,6 +123,16 @@ Each result carries a fresh readback frame; inspect it before the next step.
 take a new screenshot. `input_interrupted` reports how many events were posted
 before the stop; do not repeat the action blindly.
 
+For a knob that moves too far per pixel, add `modifiers: ["shift"]` to
+`mouse_drag` when the plug-in has a Shift fine mode. Or replace `toX` and `toY`
+with `fine_dx` and `fine_dy`, an end offset in framebuffer pixels from -64 to
+64, which is finer than one screenshot pixel. Check the readback frame after
+each drag.
+
+The Host activity ends 10 s after your last request, so the purple indicator
+does not stay up while you think. The next action restarts it; take a new
+`ax_snapshot` first, because older refs are stale.
+
 To change a slider, text field, stepper or combo box, prefer
 `set_element_value {ref, value}` over dragging. Use the value the snapshot
 reports: a Logic plug-in slider holds a raw integer, such as 18 for a ratio

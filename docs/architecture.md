@@ -418,6 +418,13 @@ each one to the centre of a framebuffer pixel, and the Host maps that pixel to a
 global point. `paste`, `type_secret`, holds and `clipboard_read` stay refused
 on this route.
 
+`mouse_drag` also takes `modifiers`, held for the whole drag, for example
+Shift for a plug-in's fine mode (#180). Instead of `toX` and `toY` it can take
+`fine_dx` and `fine_dy`: the end as an offset from the start in framebuffer
+pixels, from -64 to 64. On a 2x display one framebuffer pixel is half a point,
+finer than one screenshot pixel. The VNC route refuses both with
+`unsupported_on_route`, because its daemon takes modifiers only on clicks.
+
 ```json
 { "transport": "host-only", "targetId": "neo", "hostHelperFile": "/private/binding.json",
   "hostInput": { "applications": ["com.apple.logic10"], "operatorInput": "yield", "operatorIdleMs": 1000 } }
@@ -465,6 +472,19 @@ means up to four events, which move the pointer back to the press point. When th
 itself ends mid-action, the reply names the count and the lane retires. Nothing
 is replayed. A completed action returns one fresh Host frame, taken at least
 150 ms after its last event, as its readback.
+
+### Activity after the agent stops
+
+A Host-only executor releases the Host activity (lease, indicator and element
+refs) 10 s after the agent's last request ends (#177). The lane keeps its owner
+and executor. The next request begins a new activity, which takes about half a
+second, so refs from before the gap are stale: take a new `ax_snapshot`. The
+target profile's `hostActivityIdleMs` sets the period: 0 keeps the activity
+until the lane releases, otherwise 1000 to 600000 ms. When the agent's broker
+connection closes, the lane releases at once, through the same path as a
+`close` frame. Before this, a stalled or vanished agent kept the indicator up
+until the 60 s owner lease ended. A VNC target keeps its activity for the lane's
+lifetime, because its native input permits follow the Host lease.
 
 Events come from a private event source and carry a Host tag. A listen-only
 session event tap counts input without that tag as operator input. Without

@@ -22,7 +22,7 @@ const button = () => z.enum(['left', 'right', 'middle']).optional().describe('Mo
 const MODIFIERS = ['shift', 'rshift', 'ctrl', 'rctrl', 'alt', 'option', 'ralt', 'cmd', 'command', 'rcmd'];
 const MODIFIER_ALIASES = { option: 'alt', command: 'cmd' };
 const modifiers = () => z.array(z.enum(MODIFIERS)).min(1).max(MODIFIERS.length).optional()
-  .describe('mouse_click only: modifier keys held around the click (e.g. ["shift"] or ["cmd"])');
+  .describe('mouse_click, or mouse_drag on the Host route: modifier keys held around it (e.g. ["shift"] or ["cmd"])');
 const durationMs = () => z.number().int().min(1).max(10000).optional()
   .describe('hold_key duration in ms; the key is released before the call returns');
 
@@ -69,7 +69,8 @@ export function validateActionParameters(input) {
   const required = {
     mouse_click: ['x', 'y'], mouse_double_click: ['x', 'y'], triple_click: ['x', 'y'],
     mouse_move: ['x', 'y'], hover: ['x', 'y'],
-    mouse_drag: ['x', 'y', 'toX', 'toY'], scroll: ['x', 'y', 'direction'],
+    mouse_drag: input.fine_dx !== undefined || input.fine_dy !== undefined ? ['x', 'y'] : ['x', 'y', 'toX', 'toY'],
+    scroll: ['x', 'y', 'direction'],
     nudge: ['dx', 'dy'], key_tap: ['key'], key_type: ['text'], paste: ['text'], type_secret: ['ref'],
     hold_key: ['key', 'duration_ms'], mouse_down: ['x', 'y'],
     zoom: ['x', 'y', 'width', 'height'], wait_for_stable: ['stable_ms', 'timeout_ms'],
@@ -117,8 +118,17 @@ export function validateActionParameters(input) {
   if (input.app !== undefined && !HOST_APP_ACTIONS.has(input.action) && !HOST_VALUE_ACTIONS.has(input.action)) {
     throw new Error(`app applies only to Host route input, not ${input.action}`);
   }
-  if (input.modifiers !== undefined && input.action !== 'mouse_click') {
-    throw new Error(`modifiers apply only to mouse_click, not ${input.action}`);
+  // #180: a modifier-drag (a plug-in's Shift fine mode) runs on the Host
+  // route; the VNC route refuses it before admission.
+  if (input.modifiers !== undefined && input.action !== 'mouse_click' && input.action !== 'mouse_drag') {
+    throw new Error(`modifiers apply only to mouse_click and mouse_drag, not ${input.action}`);
+  }
+  if ((input.fine_dx !== undefined || input.fine_dy !== undefined) && input.action !== 'mouse_drag') {
+    throw new Error(`fine_dx and fine_dy apply only to mouse_drag, not ${input.action}`);
+  }
+  if ((input.fine_dx !== undefined || input.fine_dy !== undefined) &&
+      (input.toX !== undefined || input.toY !== undefined)) {
+    throw new Error('mouse_drag takes toX and toY, or fine_dx and fine_dy, not both');
   }
   // Aliases name one key; the native controller refuses a repeated keysym.
   const keys = (input.modifiers || []).map(name => MODIFIER_ALIASES[name] || name);
@@ -168,6 +178,8 @@ export function vncCommandTool() {
       '  hover          {x, y}                   → move cursor + settle wait',
       '  nudge          {dx, dy}                 → relative cursor move',
       '  mouse_drag     {x, y, toX, toY, button?} → drag from start to end (left|right|middle)',
+      '                 {x, y, fine_dx?, fine_dy?, modifiers?} → Host route: end offset in framebuffer pixels',
+      '                                            (finer than one screenshot pixel); modifiers held for the drag',
       '  scroll         {x, y, direction, amount?} → scroll (up|down|left|right)',
       '  cursor_position                         → fruitctl-tracked pointer position (not the server cursor)',
       '  mouse_down / mouse_up                   → action_queue only (refused here); see action_queue',
@@ -224,6 +236,10 @@ export function vncCommandTool() {
       dx: z.number().int().min(-50).max(50).optional().describe('Relative X offset (nudge)'),
       dy: z.number().int().min(-50).max(50).optional().describe('Relative Y offset (nudge)'),
       button: button(),
+      fine_dx: z.number().int().min(-64).max(64).optional()
+        .describe('mouse_drag on the Host route: end offset from x in framebuffer pixels, instead of toX'),
+      fine_dy: z.number().int().min(-64).max(64).optional()
+        .describe('mouse_drag on the Host route: end offset from y in framebuffer pixels, instead of toY'),
       modifiers: modifiers(),
       duration_ms: durationMs(),
       key: z.string().optional().describe('Key name or combo string (e.g. "cmd+c")'),
