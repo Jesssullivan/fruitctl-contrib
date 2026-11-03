@@ -524,6 +524,32 @@ Space behaviour on a live desktop is an attended gate.
 
 ### Element values
 
+`enter_element_value {ref, value, app?}` is for a control whose own value is not
+settable and which has an editable readout beside it, such as a Logic mixer fader
+(#181). `ref` names the readout, an `AXTextField` in the latest snapshot. The
+broker reads the readout's parent at depth 1 for its current frame, double-clicks
+its centre, types the number, presses Return and reads the parent again. `value` is
+at most 16 characters of a plain number in the readout's displayed unit. Each step
+is ordinary Host input, under every gate in the table above. Each read keeps only
+that parent's refs, so refs elsewhere go stale: one entry per strip, then a new
+snapshot.
+
+Logic reports no value on the readout and puts the figure in its label, as
+`volume fader level, -6.0 dB`. A field that shows other text, such as a strip's
+name, refuses before input with `ax_action_unsupported`. The entry is verified only
+when the figure shows the number within its displayed decimals. Logic shows no
+figure on some strips, such as Master and the buses. There the result is
+`input_interrupted` with `reason: "value_not_verified"` and `slider_moved`, and the
+agent decides from `slider_before` and `slider_after`. A refused read keeps its own
+code as the reason. In every such case the number may have been entered.
+
+The broker waits 500 milliseconds after the double-click, and asks again for up to
+1.5 seconds while the Host refuses typing with `input_focus_unavailable`, which
+posts nothing. A returned stop reports `entry_step` and
+leaves any open field as it is. A lost lease or a deadline retires the lane without
+naming a step, and the field may still be open. The Host gates do not prove the
+focused field is the readout, so check the readback frame after a first use.
+
 `set_element_value {ref, value, app?}` sets one element's `AXValue`, and
 `step_element {ref, steps, app?}` performs `AXIncrement` or `AXDecrement` up to
 10 times (#161). They need the same `hostInput` policy, local opt-in, live
