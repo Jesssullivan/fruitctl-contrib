@@ -25,7 +25,10 @@ let
     keychain = source.service != null && source.service != "" && source.account != null && source.account != ""
       && (source.keychain == null || absolute source.keychain);
   }.${source.provider};
-  publicTarget = _name: target: {
+  hostOnly = target: target.transport == "host-only";
+  # The broker refuses these fields on a Host-only profile, including the VNC
+  # defaults and a package-wide nativePackage, so that route renders none of them.
+  vncRoute = target: {
     # An unset capture deadline stays absent, never null.
     vnc = lib.filterAttrs (_: value: value != null) target.vnc;
   } // lib.optionalAttrs (target.credentialFile != null) {
@@ -34,20 +37,32 @@ let
     credential = publicSource target.credential;
   } // lib.optionalAttrs (target.secrets != { }) {
     secrets = lib.mapAttrs (_: publicSource) target.secrets;
-  } // lib.optionalAttrs (target.targetId != null) {
-    inherit (target) targetId;
-  } // lib.optionalAttrs (target.inputSource != null) {
-    inherit (target) inputSource;
   } // lib.optionalAttrs target.input.pasteUnmappable {
     input.pasteUnmappable = true;
   } // lib.optionalAttrs (clipboardPolicy target != { }) {
     clipboard = clipboardPolicy target;
+  } // lib.optionalAttrs (target.daemonPath != null || nativePath != null) {
+    daemonPath = if target.daemonPath != null then target.daemonPath else nativePath;
+  };
+  # Unset Host policy fields stay absent, never null.
+  hostOnlyRoute = target: {
+    inherit (target) transport;
+  } // lib.optionalAttrs (target.hostInput != null) {
+    hostInput = lib.filterAttrs (_: value: value != null) target.hostInput;
+  } // lib.optionalAttrs (target.hostCapture != null) {
+    hostCapture = lib.filterAttrs (_: value: value != null) target.hostCapture;
+  } // lib.optionalAttrs (target.hostActivityIdleMs != null) {
+    inherit (target) hostActivityIdleMs;
+  };
+  publicTarget = _name: target: (if hostOnly target then hostOnlyRoute target else vncRoute target)
+  // lib.optionalAttrs (target.targetId != null) {
+    inherit (target) targetId;
+  } // lib.optionalAttrs (target.inputSource != null) {
+    inherit (target) inputSource;
   } // lib.optionalAttrs (wakePolicy target != { }) {
     wake = wakePolicy target;
   } // lib.optionalAttrs (desktopStatePolicy target != { }) {
     desktopState = desktopStatePolicy target;
-  } // lib.optionalAttrs (target.daemonPath != null || nativePath != null) {
-    daemonPath = if target.daemonPath != null then target.daemonPath else nativePath;
   } // lib.optionalAttrs (target.hostHelperFile != null) {
     inherit (target) hostHelperFile;
   } // lib.optionalAttrs (target.hostHelper != null) {
@@ -145,6 +160,39 @@ let
         type = lib.types.nullOr (lib.types.strMatching "[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
         default = null;
         description = "Optional stable physical-desktop identity on the Darwin broker. Use one profile per desktop; duplicate identities are refused.";
+      };
+      transport = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum [ "host-only" ]);
+        default = null;
+        description = "Unset uses VNC. host-only drives this Mac through its installed Fruitctl Host, with no VNC, credential or native client. It requires targetId and a Host binding.";
+      };
+      hostInput = lib.mkOption {
+        default = null;
+        description = "Host-only input policy. Unset leaves the route observation-only.";
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            applications = lib.mkOption { type = lib.types.listOf lib.types.str; description = "Bundle identifiers the Host may send input to, 1 to 16 of them."; };
+            operatorInput = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "yield" "assert" ]); default = null; description = "How the route treats local operator input. Unset keeps the broker default."; };
+            operatorIdleMs = lib.mkOption { type = lib.types.nullOr (lib.types.ints.between 0 10000); default = null; description = "How long local operator input must be idle before agent input resumes, in milliseconds. Unset keeps the broker default."; };
+          };
+        });
+      };
+      hostCapture = lib.mkOption {
+        default = null;
+        description = "Host-only capture policy: which windows a capture keeps. Unset keeps the broker default.";
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            scope = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "target" "display" ]); default = null; description = "Capture the target windows or the whole display."; };
+            applications = lib.mkOption { type = lib.types.nullOr (lib.types.listOf lib.types.str); default = null; description = "Bundle identifiers a target-scope capture keeps. Not allowed with display scope."; };
+            exclude = lib.mkOption { type = lib.types.nullOr (lib.types.listOf lib.types.str); default = null; description = "Bundle identifiers a display-scope capture leaves out. Requires display scope."; };
+          };
+        });
+      };
+      hostActivityIdleMs = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        example = 10000;
+        description = "How long the Host activity outlives the last agent request: 0 keeps it until the lane releases, otherwise 1000 to 600000 milliseconds. Unset keeps the broker default.";
       };
       vnc = {
         host = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; description = "Seat-side VNC address, usually an SSH tunnel loopback endpoint."; };
@@ -287,6 +335,24 @@ let
   sshDestination = value: value == null || builtins.match "[a-zA-Z0-9_][]a-zA-Z0-9_.@:[-]{0,255}" value != null;
   absolute = value: value != null && lib.hasPrefix "/" value && !(lib.hasInfix "\n" value);
   displayUuid = value: builtins.match "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}" value != null;
+  bundleId = value: builtins.match "[A-Za-z0-9-]+([.][A-Za-z0-9-]+)*" value != null && builtins.stringLength value <= 255;
+  bundleList = value: value != [ ] && builtins.length value <= 16 && builtins.all bundleId value && lib.unique value == value;
+  hostPolicyUnset = target: target.hostInput == null && target.hostCapture == null && target.hostActivityIdleMs == null;
+  # Every VNC-route field holds its declared default, so none of it is silently dropped.
+  vncRouteUnset = target: target.vnc == { host = "127.0.0.1"; port = 15900; username = ""; requestMode = null; captureTimeoutMs = null; }
+    && target.credentialFile == null && target.credential == null && target.secrets == { } && target.daemonPath == null
+    && !target.input.pasteUnmappable && clipboardPolicy target == { };
+  hostOnlyValid = target: isDarwin && target.targetId != null
+    && (target.hostHelperFile != null || target.hostHelper != null)
+    && vncRouteUnset target
+    && (target.hostHelper == null || target.hostHelper.mapping == null);
+  hostInputValid = policy: policy == null || bundleList policy.applications;
+  hostCaptureValid = policy: policy == null || (
+    (policy.applications == null || bundleList policy.applications)
+    && (policy.exclude == null || bundleList policy.exclude)
+    && (policy.scope != "display" || policy.applications == null)
+    && (policy.scope == "display" || policy.exclude == null));
+  hostIdleValid = value: value == null || value == 0 || (value >= 1000 && value <= 600000);
   sameUuid = left: right: if left == null || right == null then left == right else lib.toUpper left == lib.toUpper right;
 in {
   options.programs.fruitctl = {
@@ -387,8 +453,8 @@ in {
         { assertion = cfg.bridgeSocketPath == null || absolute cfg.bridgeSocketPath; message = "Fruitctl bridgeSocketPath must be an absolute remote path when supplied."; }
         { assertion = cfg.bridgeCommand == "fruitctl" || absolute cfg.bridgeCommand; message = "Fruitctl bridgeCommand must be fruitctl or an absolute executable path."; }
         { assertion = isDarwin || (cfg.bridgeHost != null && cfg.bridgeHost != "" && !(lib.hasPrefix "-" cfg.bridgeHost) && !(lib.hasInfix "\n" cfg.bridgeHost)); message = "Linux Fruitctl requires an existing Darwin bridgeHost SSH alias."; }
-        { assertion = isDarwin || (cfg.nativePackage == null && builtins.all (name: cfg.targets.${name}.targetId == null && cfg.targets.${name}.inputSource == null && !cfg.targets.${name}.input.pasteUnmappable && clipboardPolicy cfg.targets.${name} == { } && cfg.targets.${name}.credentialFile == null && cfg.targets.${name}.credential == null && cfg.targets.${name}.secrets == { } && cfg.targets.${name}.daemonPath == null && cfg.targets.${name}.hostHelper == null && cfg.targets.${name}.vnc.username == "" && cfg.targets.${name}.vnc.host == "127.0.0.1" && cfg.targets.${name}.vnc.port == 15900 && cfg.targets.${name}.vnc.captureTimeoutMs == null && cfg.targets.${name}.vnc.requestMode == null && wakePolicy cfg.targets.${name} == { } && desktopStatePolicy cfg.targets.${name} == { }) targetNames); message = "Linux declares Fruitctl target names only; configure physical identities, VNC, credentials and native clients on the Darwin bridge."; }
-        { assertion = !isDarwin || builtins.all (name: let target = cfg.targets.${name}; in
+        { assertion = isDarwin || (cfg.nativePackage == null && builtins.all (name: cfg.targets.${name}.transport == null && hostPolicyUnset cfg.targets.${name} && cfg.targets.${name}.targetId == null && cfg.targets.${name}.inputSource == null && !cfg.targets.${name}.input.pasteUnmappable && clipboardPolicy cfg.targets.${name} == { } && cfg.targets.${name}.credentialFile == null && cfg.targets.${name}.credential == null && cfg.targets.${name}.secrets == { } && cfg.targets.${name}.daemonPath == null && cfg.targets.${name}.hostHelper == null && cfg.targets.${name}.vnc.username == "" && cfg.targets.${name}.vnc.host == "127.0.0.1" && cfg.targets.${name}.vnc.port == 15900 && cfg.targets.${name}.vnc.captureTimeoutMs == null && cfg.targets.${name}.vnc.requestMode == null && wakePolicy cfg.targets.${name} == { } && desktopStatePolicy cfg.targets.${name} == { }) targetNames); message = "Linux declares Fruitctl target names only; configure physical identities, VNC, credentials and native clients on the Darwin bridge."; }
+        { assertion = !isDarwin || builtins.all (name: let target = cfg.targets.${name}; in hostOnly target ||
             (if target.credential != null then target.credentialFile == null && sourceValid target.credential else absolute target.credentialFile)
             && absolute (if target.daemonPath != null then target.daemonPath else nativePath)) targetNames;
           message = "Each Darwin Fruitctl target requires exactly one VNC credential provider (credential, or an absolute credentialFile) and a qualified daemonPath or nativePackage."; }
@@ -396,6 +462,9 @@ in {
             (builtins.attrNames cfg.targets.${name}.secrets)) targetNames;
           message = "Fruitctl secrets need ref names of letters, digits, '.', '_' or '-' and a complete provider: file.path absolute, env.name a variable name, command.argv with an absolute executable, or keychain.service and account."; }
         { assertion = builtins.all (name: let helper = cfg.targets.${name}.hostHelper; in helper == null || (builtins.match "[a-zA-Z0-9][]a-zA-Z0-9_.@:[-]{0,255}" helper.sshHost != null && builtins.length helper.command == 2 && absolute (builtins.head helper.command) && builtins.match "[^[:cntrl:]]*" (builtins.head helper.command) != null && lib.hasSuffix "/FruitctlHost" (builtins.head helper.command) && builtins.elemAt helper.command 1 == "--stdio" && (helper.displayId != null || helper.displayUuid != null) && (helper.displayId == null || helper.displayId > 0) && (helper.displayUuid == null || displayUuid helper.displayUuid))) targetNames; message = "Fruitctl hostHelper requires an SSH alias, [ /absolute/path/FruitctlHost --stdio ] command and a positive displayId or a displayUuid."; }
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in !hostOnly target || hostOnlyValid target) targetNames; message = "A Host-only Fruitctl target requires Darwin, a targetId and a Host binding with no VNC mapping, and forbids VNC, credential, secret, native-client, input and clipboard settings."; }
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostOnly target || hostPolicyUnset target) targetNames; message = "Fruitctl hostInput, hostCapture and hostActivityIdleMs require the Host-only transport."; }
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostInputValid target.hostInput && hostCaptureValid target.hostCapture && hostIdleValid target.hostActivityIdleMs) targetNames; message = "Fruitctl Host policy requires 1 to 16 unique bundle identifiers, display scope for exclude only, and hostActivityIdleMs of 0 or 1000 to 600000."; }
         { assertion = builtins.all (name: cfg.targets.${name}.clipboard.ttlMs == null || cfg.targets.${name}.clipboard.read) targetNames; message = "Fruitctl clipboard.ttlMs requires clipboard.read."; }
         { assertion = builtins.all (name: sshDestination cfg.targets.${name}.wake.ssh && sshDestination cfg.targets.${name}.desktopState.ssh) targetNames; message = "Fruitctl wake.ssh and desktopState.ssh must be explicit user@host destinations or SSH aliases, not options or shell text."; }
         { assertion = builtins.all (name: let helper = cfg.targets.${name}.hostHelper; mapping = if helper == null then null else helper.mapping; in mapping == null || (mapping.qualificationReceipt != "" && mapping.displayId == helper.displayId && sameUuid mapping.displayUuid helper.displayUuid && (mapping.scale == null || (mapping.scale >= 1 && mapping.scale <= 8)) && mapping.displayBounds.width > 0 && mapping.displayBounds.height > 0)) targetNames; message = "Fruitctl hostHelper mapping requires its qualification receipt, matching displayId/displayUuid, a scale within 1-8 when set, and positive display bounds."; }
