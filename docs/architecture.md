@@ -620,7 +620,7 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `release_unconfirmed` | broker, relay, executors | Release is unconfirmed; the target stays revoked until reconciled |
 | `invalid_input` | broker | A Host input action's coordinates, keys, text or scroll are invalid; nothing was sent |
 | `host_busy` | broker | After an idle release, another session holds the Host's lease; nothing was sent and the lane is kept |
-| `agent_idle_released` | Host | The Host ended the activity after 660 s with no agent request (#177). The lane retires; the next call begins a new one |
+| `agent_idle_released` | Host | The Host ended the activity after 660 s with no agent request (#177). The lane retires. The next call fails with this code, and the call after it begins a new lane |
 | `input_target_not_allowed` | broker | The action's `app` is not one of the target's `hostInput.applications` |
 | `input_disabled` | broker, Host | The FruitctlHost menu's agent input opt-in is off |
 | `input_permission_required` | broker, Host | FruitctlHost may not post events; it lacks the Accessibility grant |

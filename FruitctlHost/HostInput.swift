@@ -603,8 +603,10 @@ enum HostInputWindowList {
     /// that read is not in the list and tells nothing.
     @MainActor
     static func mouseDownWindow(at point: CGPoint) -> Int? {
-        // AppKit measures from the bottom of the main display, global points from its top.
-        let cocoa = NSPoint(x: point.x, y: CGDisplayBounds(CGMainDisplayID()).height - point.y)
+        // AppKit measures from the bottom of the main display, global points from
+        // its top. A window's top edge is inclusive in global points and exclusive
+        // in AppKit's, so the small offset keeps a point on that edge inside it.
+        let cocoa = NSPoint(x: point.x, y: CGDisplayBounds(CGMainDisplayID()).height - point.y - 0.001)
         let number = NSWindow.windowNumber(at: cocoa, belowWindowWithWindowNumber: 0)
         return number > 0 ? number : nil
     }
@@ -629,10 +631,21 @@ enum HostInputWindowList {
                 || isSoftwareCursor(window, pointer: pointer, namesReadable: namesReadable,
                                     isWindowServer: isWindowServer)
         }
-        let first = hit.flatMap { number in
+        let hitIndex = hit.flatMap { number in
             windows.firstIndex { $0.number == number && $0.bounds.contains(point) }
-        } ?? windows.startIndex
-        guard let index = windows[first...].firstIndex(where: { $0.bounds.contains(point) && !transparent($0) }) else {
+        }
+        // The system's own answer stands, even for an alpha 0 window that takes
+        // events, unless it is a window that never receives any.
+        let index: Int
+        if let hitIndex, !(windows[hitIndex].processID == ownProcess && ownPanels.contains(windows[hitIndex].number)),
+           !isSoftwareCursor(windows[hitIndex], pointer: pointer, namesReadable: namesReadable,
+                             isWindowServer: isWindowServer) {
+            index = hitIndex
+        } else if let found = windows[(hitIndex ?? windows.startIndex)...].firstIndex(where: {
+            $0.bounds.contains(point) && !transparent($0)
+        }) {
+            index = found
+        } else {
             return (nil, nil)
         }
         return (windows[index], parent(of: index, in: windows, transparent: transparent))

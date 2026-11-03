@@ -441,7 +441,7 @@ final class HostInputTests: XCTestCase {
     private func hitTestWindows(at point: CGPoint) -> [HostWindowInfo] {
         [HostWindowInfo(processID: 185, number: 3, ownerName: "Window Server", layer: cursorLayer,
                         bounds: CGRect(x: point.x - 5, y: point.y - 5, width: 28, height: 40)),
-         HostWindowInfo(processID: 689, number: 57, ownerName: "Fruitctl Host", layer: 25,
+         HostWindowInfo(processID: 34968, number: 57, ownerName: "Fruitctl Host", layer: 25,
                         bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024)),
          HostWindowInfo(processID: 607, number: 33, ownerName: "Notification Center", layer: 21,
                         bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024)),
@@ -467,6 +467,17 @@ final class HostInputTests: XCTestCase {
         XCTAssertEqual(pick(point, windows, pointer: nil, panels: [57], hit: 113).top?.number, 113)
     }
 
+    func testAWindowTheSystemHitsCountsEvenWhenItsAlphaIsZero() {
+        // An invisible window that takes events eats the click, so it refuses.
+        let point = CGPoint(x: 800, y: 500)
+        let invisible = HostWindowInfo(processID: 700, number: 900, ownerName: "Overlay", layer: 3,
+                                       bounds: CGRect(x: 0, y: 0, width: 1637, height: 1024), alpha: 0)
+        let windows = [invisible] + hitTestWindows(at: point)
+        XCTAssertEqual(pick(point, windows, pointer: nil, hit: 900).top?.number, 900)
+        // Unnamed by the system, it is looked through as before.
+        XCTAssertEqual(pick(point, windows, pointer: point, panels: [57], hit: nil).top?.number, 33)
+    }
+
     func testAHitTheListCannotPlaceTellsNothing() {
         let point = CGPoint(x: 800, y: 500)
         let windows = hitTestWindows(at: point)
@@ -479,6 +490,8 @@ final class HostInputTests: XCTestCase {
         away[3] = HostWindowInfo(processID: 6090, number: 211, ownerName: "Logic Pro", layer: 0,
                                  bounds: CGRect(x: 1000, y: 800, width: 100, height: 100))
         XCTAssertEqual(pick(point, away, pointer: point, panels: [57], hit: 211).top?.number, 33)
+        // Nor does a hit on the list's first window count when that window is elsewhere.
+        XCTAssertNotEqual(pick(point, away, pointer: CGPoint(x: 10, y: 900), panels: [57], hit: 3).top?.number, 3)
     }
 
     func testAFocusedServiceActsForTheTargetOnlyOverItsWindow() {
@@ -726,6 +739,16 @@ final class HostInputTests: XCTestCase {
             XCTAssertEqual($0 as? HostInputError, .targetMismatch)
         }
         value.focusOwnerOverFrontmost = true
+        // A helper of the target is tied to it by its parent, with no window needed.
+        var helper = HostInputProcess(processID: 15800, bundleID: nil, executable: "PluginHelper")
+        helper.parentProcessID = value.frontmost?.processID
+        helper.regularApplication = false
+        helper.executablePath = "/Applications/Logic Pro.app/Contents/XPCServices/PluginHelper"
+        var byParent = value
+        byParent.frontmost?.bundlePath = "/Applications/Logic Pro.app"
+        byParent.focusOwner = helper
+        byParent.focusOwnerOverFrontmost = false
+        XCTAssertNoThrow(try HostInputGate.check(selectAll, byParent, start: true, pointerCheck: false))
         // An unrelated process holding focus is still refused.
         value.focusOwner = HostInputProcess(processID: 524, bundleID: "com.cmuxterm.app", executable: "cmux")
         XCTAssertThrowsError(try HostInputGate.check(selectAll, value, start: true, pointerCheck: false)) {

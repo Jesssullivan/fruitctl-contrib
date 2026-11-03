@@ -3,6 +3,7 @@
 // once when the agent's connection closes. #180: modifier-drags and fine drag
 // offsets on the Host route. Mock SSH Host only; no desktop.
 import test from 'node:test';
+import { TYPED_REFUSAL_CODES } from '../lib/mcp/capabilities.js';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import fs from 'node:fs/promises';
@@ -235,6 +236,8 @@ test('a heartbeat the Host refuses after its own idle cut retires the lane by na
     await delay(800);
     assert.equal(executor.failed?.code, 'agent_idle_released');
     assert.match(executor.failed.message, /agent_idle_released/);
+    // The MCP layer keeps the code for the agent.
+    assert.ok(TYPED_REFUSAL_CODES.includes('agent_idle_released'));
   } finally { await executor.close().catch(() => {}); }
 });
 
