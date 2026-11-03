@@ -124,7 +124,8 @@ take a new screenshot. `input_interrupted` reports how many events were posted
 before the stop; do not repeat the action blindly.
 
 For a knob that moves too far per pixel, add `modifiers: ["shift"]` to
-`mouse_drag` when the plug-in has a Shift fine mode. Or replace `toX` and `toY`
+`mouse_drag` when the plug-in has a Shift fine mode. Shift is the only drag
+modifier. Or replace `toX` and `toY`
 with `fine_dx` and `fine_dy`, an end offset in framebuffer pixels from -64 to
 64, which is finer than one screenshot pixel. Check the readback frame after
 each drag.

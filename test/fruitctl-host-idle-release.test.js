@@ -155,13 +155,14 @@ test('a modifier-drag and a fine drag reach the Host on the Host route only', as
   try {
     await executor.execute([{ action: 'mouse_drag', x: 100, y: 50, toX: 100, toY: 60, modifiers: ['shift'] }]);
     await executor.execute([{ action: 'mouse_drag', x: 100, y: 50, fine_dy: -1 }]);
-    await executor.execute([{ action: 'mouse_drag', x: 100, y: 50, fine_dx: 3, fine_dy: 2, modifiers: ['cmd'] }]);
+    await executor.execute([{ action: 'mouse_drag', x: 100, y: 50, fine_dx: 3, fine_dy: 2, modifiers: ['shift'] }]);
     const drags = host.requests.filter(request => request.action === 'input').map(request => request.params);
     assert.deepEqual(drags[0].modifiers, ['shift']);
     // The mock display maps screenshot pixels one to one onto framebuffer pixels.
     assert.deepEqual([drags[1].x, drags[1].y, drags[1].to_x, drags[1].to_y], [100, 50, 100, 49]);
-    assert.deepEqual([drags[2].to_x, drags[2].to_y, drags[2].modifiers], [103, 52, ['cmd']]);
-    for (const bad of [{ fine_dx: 65 }, { fine_dy: 1, toX: 1, toY: 1 }, { fine_dx: -200 }, { fine_dy: 1.5 }]) {
+    assert.deepEqual([drags[2].to_x, drags[2].to_y, drags[2].modifiers], [103, 52, ['shift']]);
+    for (const bad of [{ fine_dx: 65 }, { fine_dy: 1, toX: 1, toY: 1 }, { fine_dx: -200 }, { fine_dy: 1.5 },
+      { fine_dx: 0, fine_dy: 0 }, { fine_dy: 1, modifiers: ['cmd'] }, { fine_dy: 1, modifiers: ['shift', 'alt'] }]) {
       await assert.rejects(executor.execute([{ action: 'mouse_drag', x: 100, y: 50, ...bad }]),
         error => isPreAdmissionRefusal(error) && error.code === 'invalid_input', JSON.stringify(bad));
     }
@@ -186,4 +187,62 @@ test('the MCP schema takes modifiers and fine offsets on mouse_drag', () => {
   assert.throws(() => validateActionParameters({ action: 'mouse_move', x: 1, y: 1, fine_dx: 1 }), /only to mouse_drag/);
   assert.throws(() => validateActionParameters({ action: 'scroll', x: 1, y: 1, direction: 'up', modifiers: ['shift'] }),
     /mouse_click and mouse_drag/);
+});
+
+test('a refused request re-arms the idle period, and health checks do not hold it', async () => {
+  const { executor, host } = await executorFor({ idle: 80 });
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    await assert.rejects(executor.execute([{ action: 'mouse_drag', x: 1, y: 1, fine_dx: 99 }]),
+      error => isPreAdmissionRefusal(error));
+    for (let index = 0; index < 4; index++) {
+      await executor.execute([{ action: 'health' }]);
+      await delay(30);
+    }
+    await delay(150);
+    assert.equal(count(host, 'release_activity'), 1);
+  } finally { await executor.close().catch(() => {}); }
+});
+
+test('a request during an unanswered release is refused before admission; the deadline fails the executor', async () => {
+  let drop = true;
+  const { executor } = await executorFor({ idle: 30, alter(request, response) {
+    return request.action === 'release_activity' && drop ? null : response;
+  } });
+  try {
+    await executor.execute([{ action: 'ax_snapshot' }]);
+    await delay(80);
+    // The release committed: refs are gone before its reply.
+    await assert.rejects(executor.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]),
+      error => isPreAdmissionRefusal(error) && error.code === 'stale_ref');
+    await delay(2300);
+    assert.ok(executor.failed, 'an unconfirmed release still fails closed');
+    drop = false;
+  } finally { await executor.close().catch(() => {}); }
+});
+
+test('another session on the Host after an idle release is a per-call host_busy, and release still proves itself', async () => {
+  let busy = false;
+  const { executor, host } = await executorFor({ idle: 40, alter(request, response) {
+    if (request.action === 'begin_activity' && busy) {
+      return { id: request.id, success: false, error: { code: -32000, message: 'host_busy' } };
+    }
+    if (request.action === 'health' && busy) {
+      Object.assign(response.result, { session_id: 'another-session', ready: true, overlay_ready: true,
+        capture_ready: true, lease_remaining_ms: 2500 });
+    }
+    return response;
+  } });
+  try {
+    await executor.execute([{ action: 'screenshot' }]);
+    await delay(150);
+    assert.equal(count(host, 'release_activity'), 1);
+    busy = true;
+    const responses = await executor.execute([{ action: 'screenshot' }, { action: 'screenshot' }]);
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0].error.data.code, 'host_busy');
+    assert.equal(executor.failed, undefined);
+    await executor.release();
+    assert.equal(executor.failed, undefined);
+  } finally { await executor.close().catch(() => {}); }
 });
