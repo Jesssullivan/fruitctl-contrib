@@ -87,6 +87,19 @@ struct HostResponse: Encodable {
         let code: Int
         let message: String
         let data: HostCaptureDiagnostic?
+        /// #182: a refusal's own detail object, sent as `data` when no
+        /// capture diagnostic is present.
+        var detail: [String: HostValue]? = nil
+
+        enum CodingKeys: String, CodingKey { case code, message, data }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(code, forKey: .code)
+            try container.encode(message, forKey: .message)
+            if let data { try container.encode(data, forKey: .data) }
+            else if let detail { try container.encode(HostValue.object(detail), forKey: .data) }
+        }
     }
 
     static func ok(_ request: HostRequest, _ result: [String: HostValue]) -> HostResponse {
@@ -97,6 +110,11 @@ struct HostResponse: Encodable {
                         data: HostCaptureDiagnostic? = nil) -> HostResponse {
         HostResponse(id: id, success: false, result: nil,
                      error: RPCError(code: code, message: message, data: data))
+    }
+
+    static func failure(id: HostValue?, message: String, detail: [String: HostValue]) -> HostResponse {
+        HostResponse(id: id, success: false, result: nil,
+                     error: RPCError(code: -32000, message: message, data: nil, detail: detail))
     }
 
     func line() throws -> Data { try Self.encodeLine(self) }

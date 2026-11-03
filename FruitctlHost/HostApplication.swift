@@ -87,6 +87,11 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private var activeInputSession: HostInputSession?
     /// The local Fruitctl menu is open: the operator is reaching for Stop.
     private var humanMenuOpen = false
+    /// #177: when the lease owner last sent a request other than a renewal.
+    /// A broker that keeps renewing for an agent that stopped is cut off at
+    /// `agentIdleMilliseconds`, above the broker's own 600 s maximum.
+    private var lastAgentRequestAt: UInt64?
+    static let agentIdleMilliseconds: UInt64 = 660_000
     private let inputPreferences: HostInputPreferences
     private let inputPoster = HostSystemInputPoster()
     private lazy var inputMonitor = HostOperatorInputMonitor(clock: { [clock] in clock.milliseconds() })
@@ -412,6 +417,9 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
     private func tick() {
         let now = clock.milliseconds()
         if lease.expire(at: now) { clearActivityUI() }
+        if lease.active != nil, let last = lastAgentRequestAt, now >= last &+ Self.agentIdleMilliseconds {
+            lease.invalidate(); clearActivityUI()
+        }
         if lease.active != nil || idleReference.armedID != nil || idleReference.isExporting {
             if !activityEligible { invalidateActivity(reason: .activityUnavailable) }
             else if !capture.enabled { invalidateActivity(reason: .captureDisabled) }
@@ -576,6 +584,10 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             && !(healthPermissionGranted ?? permission.isGranted) {
             invalidateActivity(reason: .permissionUnavailable)
         }
+        if ["begin_activity", "capture", "screenshot", "ax_snapshot", "ax_action", "ax_verify", "input",
+            "ax_value"].contains(request.action) {
+            lastAgentRequestAt = now
+        }
         do {
             switch request.action {
             case "health":
@@ -605,6 +617,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 status["secure_input"] = .boolean(IsSecureEventInputEnabled())
                 // Requests on one connection are answered as each completes.
                 status["request_pipelining"] = .boolean(true)
+                // #177: the Host's own bound on an activity with no agent request.
+                status["agent_idle_release_ms"] = .integer(Int64(Self.agentIdleMilliseconds))
                 // Capture and AX replies may be split with reply_part_bytes.
                 status["reply_parts"] = .boolean(true)
                 status["image_formats"] = .array([HostImageFormat.png, .jpeg].map { .string($0.rawValue) })
@@ -817,6 +831,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
             return .failure(id: request.id, message: error.rawValue)
         } catch let error as HostInputError {
             return .failure(id: request.id, message: error.rawValue)
+        } catch let refusal as HostInputRefusal {
+            return .failure(id: request.id, message: refusal.error.rawValue, detail: refusal.detail)
         } catch {
             return .failure(id: request.id, message: "host_action_failed")
         }
@@ -980,6 +996,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
         guard !captureInProgress, !axSnapshotInProgress, !axActionInProgress, !inputInProgress,
               !idleReference.isExporting else { throw HostLeaseError.notReady }
         let steps = try HostInputPlanner.plan(input, geometry: geometry)
+        // #178: hot corners and the auto-hidden Dock edge, read fresh each time.
+        try HostScreenEdges.read().check(steps, display: geometry.bounds)
         inputMonitor.start()
         inputInProgress = true
         defer { inputInProgress = false }
@@ -1031,6 +1049,8 @@ final class HostApplicationController: NSObject, NSApplicationDelegate, NSMenuDe
                 outcome.metadata(input, frontmost: frontmost, monitor: inputMonitor.mode))]) { _, value in value }
         } catch let refusal as HostInputError {
             // Raised before the first event: nothing was posted.
+            throw refusal
+        } catch let refusal as HostInputRefusal {
             throw refusal
         } catch let refusal as HostAXActionError {
             throw refusal
