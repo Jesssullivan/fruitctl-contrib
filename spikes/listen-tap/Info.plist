@@ -3,22 +3,22 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>io.tinyland.legalab.listen-tap-spike</string>
+	<string>io.tinyland.legalab.listen-tap-stream</string>
 	<key>CFBundleName</key>
-	<string>Listen Tap Spike</string>
+	<string>Listen Tap Stream</string>
 	<key>CFBundleExecutable</key>
 	<string>listen-tap</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>0.2</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.4</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Listen Tap Spike records the audio of one chosen process so an agent can analyze what it plays.</string>
+	<string>Listen Tap Stream records the audio of one chosen process so an agent can analyze what it plays.</string>
 </dict>
 </plist>

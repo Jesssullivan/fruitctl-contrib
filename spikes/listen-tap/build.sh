@@ -4,9 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 swiftc -O -o listen-tap ListenTap.swift
-rm -rf ListenTapSpike.app
-mkdir -p ListenTapSpike.app/Contents/MacOS
-cp Info.plist ListenTapSpike.app/Contents/Info.plist
-cp listen-tap ListenTapSpike.app/Contents/MacOS/listen-tap
-codesign --force --sign - --timestamp=none ListenTapSpike.app
-codesign --display --verbose=2 ListenTapSpike.app 2>&1 | grep -E 'Identifier|CDHash|Signature'
+rm -rf ListenTapStream.app
+mkdir -p ListenTapStream.app/Contents/MacOS
+cp Info.plist ListenTapStream.app/Contents/Info.plist
+cp listen-tap ListenTapStream.app/Contents/MacOS/listen-tap
+codesign --force --sign - --timestamp=none ListenTapStream.app
+codesign --display --verbose=2 ListenTapStream.app 2>&1 | grep -E 'Identifier|CDHash|Signature'
