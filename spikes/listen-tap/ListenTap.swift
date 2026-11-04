@@ -19,6 +19,10 @@
 //       [--source-bundle-id ID] [--bar-map FILE | --start-bar N --tempo-milli-bpm M]
 //       [--offset-us N] [--target-first N --target-last N] [--pre-roll N] [--tail N]
 //       [--dry-header]   print the header only: no tap, no device IO
+//       [--mono]   mono mixdown tap instead of stereo (TIN-7927 level test)
+//       [--expect-signal-after-s S]   no signal by S s: rebuild the tap once, then
+//       exit 4 as silent_capture (TIN-7928). Set S past any leading silence.
+//       [--level-state measured --level-gain-hundredths N --level-basis TEXT]
 //       [--uid-hmac-key-file PATH]   per-host secret for outputDevice.uidHmac
 //       (default ~/.config/legalab/listen-uid-hmac.key; refused if missing)
 //       Creates a private stereo-mixdown tap on the process and a private
@@ -338,6 +342,8 @@ final class Capture: @unchecked Sendable {
     var peak: Float = 0
     var nonInterleaved = false
     var firstNonzeroFrame = -1
+    var zeroCallbacks = 0
+    let firstSignal = Atomic<Int>(-1)  // first non-zero frame, read by the watch
 
     init(frames: Int, channels: Int, ringSeconds: Double, rate: Double) {
         self.frames = frames
@@ -360,6 +366,11 @@ struct StreamOptions {
     var targetLast: Int? = nil
     var preRoll = 0
     var tail = 0
+    var mono = false  // a mono mixdown tap: averages every output channel (TIN-7927)
+    var expectSignalAfterS: Double? = nil  // all-zero watch (TIN-7928)
+    var levelState: String? = nil  // "measured" with levelGain from a reference tone
+    var levelGainHundredths: Int? = nil
+    var levelBasis: String? = nil
 }
 
 func captureID() -> String {
@@ -424,8 +435,13 @@ func streamHeader(rate: Double, channels: Int, mute: Bool, options: StreamOption
                          "sampleRateHz": Int(outRate), "outputChannels": outChannels],
         "alignment": ["method": "none", "offsetUs": options.offsetUs, "calibrationOffsetUs": NSNull(),
                       "calibrationJitterUs": NSNull(), "sppHostTimeUs": NSNull()],
-        "levelCalibration": ["state": "inferred", "gainDbHundredths": gain,
-                             "basis": "20 log10 of \(pairs) stereo output pairs. Inferred from the 2026-11-04 content test, not measured."],
+        "levelCalibration": options.levelState == "measured" ? [
+            "state": "measured", "gainDbHundredths": options.levelGainHundredths ?? 0,
+            "basis": options.levelBasis ?? "Measured against a reference tone (TIN-7927)."] : [
+            "state": "inferred", "gainDbHundredths": options.mono ? Int((2000.0 * log10(Double(max(1, outChannels)))).rounded()) : gain,
+            "basis": options.mono
+                ? "20 log10 of \(outChannels) output channels, mono mixdown. Inferred, not measured."
+                : "20 log10 of \(pairs) stereo output pairs. Inferred from the 2026-11-04 content test, not measured."],
         "barMap": barMap, "targetBars": ["first": first, "last": last],
         "preRollBars": options.preRoll, "tailBars": options.tail,
     ]
@@ -463,34 +479,47 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
         return
     }
 
-    let description = CATapDescription(stereoMixdownOfProcesses: target)
-    description.uuid = UUID()
-    description.isPrivate = true
-    description.name = "listen-tap-stream-\(getpid())"
-    description.muteBehavior = mute ? .muted : .unmuted
-    var tap = AudioObjectID(kAudioObjectUnknown)
-    try check(AudioHardwareCreateProcessTap(description, &tap), "create process tap")
-    defer { AudioHardwareDestroyProcessTap(tap) }
-    let tapUID = readString(tap, kAudioTapPropertyUID) ?? description.uuid.uuidString
-    var format = AudioStreamBasicDescription()
-    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-    var formatAddr = address(kAudioTapPropertyFormat)
-    try check(AudioObjectGetPropertyData(tap, &formatAddr, 0, nil, &size, &format), "read tap format")
+    // Tap and private aggregate, built so the all-zero watch can rebuild them once.
+    func buildTap() throws -> (AudioObjectID, AudioObjectID, AudioStreamBasicDescription) {
+        let description = options.mono
+            ? CATapDescription(monoMixdownOfProcesses: target)
+            : CATapDescription(stereoMixdownOfProcesses: target)
+        description.uuid = UUID()
+        description.isPrivate = true
+        description.name = "listen-tap-stream-\(getpid())"
+        description.muteBehavior = mute ? .muted : .unmuted
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        try check(AudioHardwareCreateProcessTap(description, &tap), "create process tap")
+        let tapUID = readString(tap, kAudioTapPropertyUID) ?? description.uuid.uuidString
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var formatAddr = address(kAudioTapPropertyFormat)
+        let fstatus = AudioObjectGetPropertyData(tap, &formatAddr, 0, nil, &size, &format)
+        if fstatus != noErr { AudioHardwareDestroyProcessTap(tap); try check(fstatus, "read tap format") }
+        let aggregate: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "listen-tap-stream",
+            kAudioAggregateDeviceUIDKey: "listen-tap-stream-" + UUID().uuidString,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true]],
+        ]
+        var device = AudioObjectID(kAudioObjectUnknown)
+        let astatus = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &device)
+        if astatus != noErr { AudioHardwareDestroyProcessTap(tap); try check(astatus, "create private aggregate device") }
+        return (tap, device, format)
+    }
+
+    var (tap, device, format) = try buildTap()
+    var procID: AudioDeviceIOProcID?
+    var rebuilds = 0
+    defer {
+        if let procID { AudioDeviceStop(device, procID); AudioDeviceDestroyIOProcID(device, procID) }
+        AudioHardwareDestroyAggregateDevice(device)
+        AudioHardwareDestroyProcessTap(tap)
+    }
     let tTap = mach_absolute_time()
-
-    let aggregate: [String: Any] = [
-        kAudioAggregateDeviceNameKey: "listen-tap-stream",
-        kAudioAggregateDeviceUIDKey: "listen-tap-stream-" + UUID().uuidString,
-        kAudioAggregateDeviceIsPrivateKey: true,
-        kAudioAggregateDeviceIsStackedKey: false,
-        kAudioAggregateDeviceTapAutoStartKey: true,
-        kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true]],
-    ]
-    var device = AudioObjectID(kAudioObjectUnknown)
-    try check(AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &device), "create private aggregate device")
-    defer { AudioHardwareDestroyAggregateDevice(device) }
-    let tAggregate = mach_absolute_time()
-
+    let tAggregate = tTap
     let rate = format.mSampleRate
     let channels = Int(max(1, format.mChannelsPerFrame))
     let capture = Capture(frames: Int(seconds * rate), channels: channels, ringSeconds: 4, rate: rate)
@@ -554,6 +583,7 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
     writer.start()
 
     let finished = DispatchSemaphore(value: 0)
+    func startProc(on device: AudioObjectID) throws -> AudioDeviceIOProcID? {
     var procID: AudioDeviceIOProcID?
     try check(AudioDeviceCreateIOProcIDWithBlock(&procID, device, nil) { now, input, inTime, _, _ in
         // Real-time thread: no allocation, no locks, no I/O.
@@ -583,11 +613,17 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
             src = list[0].mData.map { UnsafePointer($0.assumingMemoryBound(to: Float.self)) }
         }
         guard let src, n > 0 else { return }
+        var blockPeak: Float = 0
         for i in 0..<(n * c.channels) {
             let v = abs(src[i])
-            if v > c.peak { c.peak = v }
-            if c.firstNonzeroFrame < 0 && v > 0 { c.firstNonzeroFrame = seen + i / c.channels }
+            if v > blockPeak { blockPeak = v }
+            if c.firstNonzeroFrame < 0 && v > 0 {
+                c.firstNonzeroFrame = seen + i / c.channels
+                c.firstSignal.store(c.firstNonzeroFrame, ordering: .releasing)
+            }
         }
+        if blockPeak > c.peak { c.peak = blockPeak }
+        if blockPeak == 0 { c.zeroCallbacks += 1 }
         c.maxCallbackFrames = max(c.maxCallbackFrames, n)
         c.ring.write(src, n * c.channels)
         if seen == 0 { c.firstInputHost.store(Int(inTime.pointee.mHostTime), ordering: .releasing) }
@@ -598,21 +634,58 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
         }
     }, "create capture IO proc")
     try check(AudioDeviceStart(device, procID), "start private aggregate device")
+    return procID
+    }
+    procID = try startProc(on: device)
     let tStart = mach_absolute_time()
-    let ok = finished.wait(timeout: .now() + seconds + 3) == .success
+    var silentCapture = false
+    var ok = false
+    if let after = options.expectSignalAfterS {
+        // TIN-7928: no non-zero sample by `after` seconds of known playback means
+        // a stuck tap or a missing grant. Rebuild tap and aggregate once, then fail.
+        let rateNs = 1e9
+        while true {
+            if capture.firstSignal.load(ordering: .acquiring) >= 0 || capture.done.load(ordering: .acquiring) { break }
+            if hostNs(mach_absolute_time() &- tStart) / rateNs >= after * Double(rebuilds + 1) {
+                if rebuilds == 0 {
+                    rebuilds = 1
+                    if let p = procID { AudioDeviceStop(device, p); AudioDeviceDestroyIOProcID(device, p) }
+                    procID = nil
+                    AudioHardwareDestroyAggregateDevice(device)
+                    AudioHardwareDestroyProcessTap(tap)
+                    (tap, device, format) = try buildTap()
+                    procID = try startProc(on: device)
+                    emit(["event": "tap-rebuilt", "afterS": after])
+                    continue
+                }
+                silentCapture = true
+                break
+            }
+            usleep(10_000)
+        }
+    }
+    if !silentCapture {
+        ok = finished.wait(timeout: .now() + seconds + 3) == .success
+    }
     let tDone = mach_absolute_time()
-    AudioDeviceStop(device, procID)
-    if let procID { AudioDeviceDestroyIOProcID(device, procID) }
+    if let p = procID { AudioDeviceStop(device, p); AudioDeviceDestroyIOProcID(device, p) }
+    procID = nil
     capture.done.store(true, ordering: .releasing)
     _ = writerDone.wait(timeout: .now() + 5)
     let tWriter = mach_absolute_time()
     if fd != STDOUT_FILENO { close(fd) }
 
+    let endDevice = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
+    let endUID = readString(endDevice, kAudioDevicePropertyDeviceUID) ?? ""
+    let endRate = readScalar(endDevice, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, Float64(0)) ?? 0
+    let endChannels = channelCount(endDevice, kAudioObjectPropertyScopeOutput)
+    let deviceChanged = endUID != outUID || endRate != outRate || endChannels != outChannels
+    let endHmac = (try? uidHmacHex(endUID, keyPath: options.uidKeyPath)).map { "hmac-sha256/" + $0 } ?? ""
     let ms = { (a: UInt64, b: UInt64) in hostNs(b &- a) / 1e6 }
     let cbs = max(1, capture.callbacks)
     let firstHost = UInt64(capture.firstInputHost.load(ordering: .acquiring))
     emit([
-        "event": "capture-done", "version": "0.2", "captureId": id, "finished": ok, "target": targetLabel,
+        "event": "capture-done", "version": "0.3", "captureId": id, "finished": ok, "target": targetLabel,
         "mute": mute, "rate": rate, "channels": channels, "nonInterleaved": capture.nonInterleaved,
         "framesSeen": capture.framesSeen.load(ordering: .acquiring), "callbacks": capture.callbacks,
         "bufferFrames": bufferFrames, "maxCallbackFrames": capture.maxCallbackFrames,
@@ -624,9 +697,13 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
         "captureWallMs": ms(tStart, tDone), "writerDrainMs": ms(tDone, tWriter),
         "inputAgeMeanMs": capture.sumAgeNs / Double(cbs) / 1e6, "inputAgeMaxMs": capture.maxAgeNs / 1e6,
         "outputChannels": outChannels, "levelGainDbHundredths": gain,
+        "zeroCallbacks": capture.zeroCallbacks, "rebuilds": rebuilds, "silentCapture": silentCapture,
+        "outputDeviceAtEnd": ["uidHmac": endHmac, "sampleRateHz": Int(endRate), "outputChannels": endChannels],
+        "deviceChanged": deviceChanged, "mono": options.mono,
         "cpuSeconds": cpuSeconds() - cpu0, "maxRSSMB": maxRSSMegabytes(),
     ])
     if writeFailed { throw SpikeError("stream write failed") }
+    if silentCapture { emit(["event": "error", "message": "silent_capture"]); exit(4) }
 }
 
 // MARK: - main
@@ -683,6 +760,11 @@ do {
         options.targetLast = intValue(args, "--target-last")
         options.preRoll = intValue(args, "--pre-roll") ?? 0
         options.tail = intValue(args, "--tail") ?? 0
+        options.mono = args.contains("--mono")
+        options.expectSignalAfterS = value(args, "--expect-signal-after-s").flatMap { Double($0) }
+        options.levelState = value(args, "--level-state")
+        options.levelGainHundredths = intValue(args, "--level-gain-hundredths")
+        options.levelBasis = value(args, "--level-basis")
         try runCapture(target: target, targetLabel: label, seconds: seconds, outPath: value(args, "--out"),
                        toStdout: args.contains("--stdout"), mute: args.contains("--mute"), options: options,
                        dryHeader: args.contains("--dry-header"))

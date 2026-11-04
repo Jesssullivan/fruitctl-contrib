@@ -11,8 +11,8 @@ mode=${1:-file}; run=${2:-1}
 SECONDS_CAP=${CAPTURE_SECONDS:-4.5}
 V1=(--source-kind test-audio --source-bundle-id com.apple.afplay --start-bar 1 --pre-roll 1 --tail 1
     --target-first 2 --target-last "${TARGET_LAST:-4}")
-APP=$D/ListenTapStream.app
-pgrep -f 'ListenTapStream.app/Contents/MacOS/listen-tap' >/dev/null && { echo '{"event":"refused","why":"spike already running"}' >&2; exit 3; }
+APP=$D/ListenTapStream3.app
+pgrep -f 'ListenTapStream3.app/Contents/MacOS/listen-tap' >/dev/null && { echo '{"event":"refused","why":"spike already running"}' >&2; exit 3; }
 pgrep -lf 'MacOS/Logic Pro' >/dev/null && { echo '{"event":"refused","why":"Logic is running"}' >&2; exit 3; }
 rm -f "ct-$mode-$run".* ct.fifo
 /usr/bin/afplay "${TONE_WAV:-tone-m60.wav}" & AP=$!
@@ -29,8 +29,8 @@ else
   timeout 15 /usr/bin/open -n -W --stdout "$D/ct-$mode-$run.out" --stderr "$D/ct-$mode-$run.err" "$APP" --args capture --pid "$AP" --seconds "$SECONDS_CAP" --mute "${V1[@]}" --out "$D/ct-$mode-$run.lstn"
 fi
 # hard bounds: end the spike and the tone whatever happened
-for _ in $(seq 1 100); do pgrep -f 'ListenTapStream.app/Contents/MacOS/listen-tap' >/dev/null || break; sleep 0.1; done
-pkill -f 'ListenTapStream.app/Contents/MacOS/listen-tap' && echo '{"event":"killed-spike"}' >> "ct-$mode-$run.err"
+for _ in $(seq 1 100); do pgrep -f 'ListenTapStream3.app/Contents/MacOS/listen-tap' >/dev/null || break; sleep 0.1; done
+pkill -f 'ListenTapStream3.app/Contents/MacOS/listen-tap' && echo '{"event":"killed-spike"}' >> "ct-$mode-$run.err"
 kill "$AP" 2>/dev/null; wait "$AP" 2>/dev/null
 [ "$mode" = fifo ] && { wait "$OP" 2>/dev/null; rm -f ct.fifo; }
 echo "{\"event\":\"script-done\",\"mode\":\"$mode\",\"start\":\"$start\"}" >> "ct-$mode-$run.err"
