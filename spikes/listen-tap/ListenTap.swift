@@ -19,6 +19,8 @@
 //       [--source-bundle-id ID] [--bar-map FILE | --start-bar N --tempo-milli-bpm M]
 //       [--offset-us N] [--target-first N --target-last N] [--pre-roll N] [--tail N]
 //       [--dry-header]   print the header only: no tap, no device IO
+//       [--uid-hmac-key-file PATH]   per-host secret for outputDevice.uidHmac
+//       (default ~/.config/legalab/listen-uid-hmac.key; refused if missing)
 //       Creates a private stereo-mixdown tap on the process and a private
 //       aggregate device that holds only the tap. Version 0.2 streams: the IO
 //       proc copies each callback into a lock-free ring, and a writer thread
@@ -347,6 +349,7 @@ final class Capture: @unchecked Sendable {
 }
 
 struct StreamOptions {
+    var uidKeyPath = NSString(string: "~/.config/legalab/listen-uid-hmac.key").expandingTildeInPath
     var sourceKind = "test-audio"
     var sourceBundleID = "unknown"
     var barMap: [String: Any]? = nil
@@ -368,9 +371,19 @@ func captureID() -> String {
     return "cap-\(f.string(from: Date()))-\(hex)"
 }
 
-func sha256Hex(_ text: String) -> String {
-    SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+/// HMAC-SHA256 of the device UID, keyed by a per-host secret outside Git, as
+/// ListenStreamHeaderV1 outputDevice.uidHmac requires: a plain hash of a
+/// guessable UID would be a stable device identifier.
+func uidHmacHex(_ uid: String, keyPath: String) throws -> String {
+    guard let key = FileManager.default.contents(atPath: keyPath), key.count >= 16 else {
+        throw SpikeError("no per-host UID key of 16 bytes or more at \(keyPath)")
+    }
+    let mac = HMAC<SHA256>.authenticationCode(for: Data(uid.utf8), using: SymmetricKey(data: key))
+    return mac.map { String(format: "%02x", $0) }.joined()
 }
+
+/// The process each source kind must name (legalab tools/legalab_listen.py).
+let bundleBySourceKind = ["logic": "com.apple.logic10", "test-audio": "com.apple.afplay"]
 
 /// write(2) until done; false on a closed pipe or another error.
 func writeAll(_ fd: Int32, _ base: UnsafeRawPointer, _ bytes: Int) -> Bool {
@@ -389,7 +402,7 @@ func writeAll(_ fd: Int32, _ base: UnsafeRawPointer, _ bytes: Int) -> Bool {
 /// ListenStreamHeaderV1 without firstInputHostTimeUs, which the writer adds
 /// at the first callback. Every number is a whole unit.
 func streamHeader(rate: Double, channels: Int, mute: Bool, options: StreamOptions,
-                  outUID: String, outRate: Double, outChannels: Int) -> [String: Any] {
+                  outUID: String, outRate: Double, outChannels: Int) throws -> [String: Any] {
     let pairs = max(1, outChannels / 2)
     let gain = Int((2000.0 * log10(Double(pairs))).rounded())
     let barMap: [String: Any] = options.barMap ?? [
@@ -407,7 +420,8 @@ func streamHeader(rate: Double, channels: Int, mute: Bool, options: StreamOption
         "captureId": captureID(),
         "source": ["kind": options.sourceKind, "bundleId": options.sourceBundleID, "tapMute": mute ? "muted" : "unmuted"],
         "tap": ["mode": channels == 1 ? "mono-mixdown" : "stereo-mixdown", "aggregate": "tap-only"],
-        "outputDevice": ["uidSha256": "sha256/" + sha256Hex(outUID), "sampleRateHz": Int(outRate), "outputChannels": outChannels],
+        "outputDevice": ["uidHmac": "hmac-sha256/" + (try uidHmacHex(outUID, keyPath: options.uidKeyPath)),
+                         "sampleRateHz": Int(outRate), "outputChannels": outChannels],
         "alignment": ["method": "none", "offsetUs": options.offsetUs, "calibrationOffsetUs": NSNull(),
                       "calibrationJitterUs": NSNull(), "sppHostTimeUs": NSNull()],
         "levelCalibration": ["state": "inferred", "gainDbHundredths": gain,
@@ -430,6 +444,9 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
     // Test audio is muted at the tap so it never reaches the output; Logic is never muted.
     if options.sourceKind == "test-audio" && !mute { throw SpikeError("test-audio needs --mute") }
     if options.sourceKind == "logic" && mute { throw SpikeError("a logic source is never muted") }
+    guard let wanted = bundleBySourceKind[options.sourceKind], options.sourceBundleID == wanted else {
+        throw SpikeError("a \(options.sourceKind) source names \(bundleBySourceKind[options.sourceKind] ?? "a known bundle")")
+    }
     signal(SIGPIPE, SIG_IGN)
 
     let outDevice = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
@@ -438,7 +455,7 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
     let outChannels = channelCount(outDevice, kAudioObjectPropertyScopeOutput)
     if dryHeader {
         // Read-only: the header a capture would send, with no tap and no device IO.
-        var h = streamHeader(rate: outRate, channels: 2, mute: mute, options: options,
+        var h = try streamHeader(rate: outRate, channels: 2, mute: mute, options: options,
                              outUID: outUID, outRate: outRate, outChannels: outChannels)
         h["firstInputHostTimeUs"] = Int(hostNs(mach_absolute_time()) / 1000)
         let data = try JSONSerialization.data(withJSONObject: h, options: [.sortedKeys])
@@ -480,7 +497,7 @@ func runCapture(target: [AudioObjectID], targetLabel: String, seconds: Double, o
     capture.nonInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
     let bufferFrames = readScalar(device, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, UInt32(0)) ?? 0
 
-    var header = streamHeader(rate: rate, channels: channels, mute: mute, options: options,
+    var header = try streamHeader(rate: rate, channels: channels, mute: mute, options: options,
                               outUID: outUID, outRate: outRate, outChannels: outChannels)
     let id = header["captureId"] as! String
     let gain = (header["levelCalibration"] as! [String: Any])["gainDbHundredths"] as! Int
@@ -653,7 +670,8 @@ do {
         guard !target.isEmpty else { throw SpikeError("no Core Audio process object for the target") }
         var options = StreamOptions()
         options.sourceKind = value(args, "--source-kind") ?? "test-audio"
-        options.sourceBundleID = value(args, "--source-bundle-id") ?? bundle
+        options.sourceBundleID = value(args, "--source-bundle-id") ?? bundleBySourceKind[options.sourceKind] ?? bundle
+        if let key = value(args, "--uid-hmac-key-file") { options.uidKeyPath = key }
         if let path = value(args, "--bar-map") {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             options.barMap = try JSONSerialization.jsonObject(with: data) as? [String: Any]

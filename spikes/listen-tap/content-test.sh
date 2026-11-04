@@ -9,7 +9,7 @@ D=${LISTEN_TAP_DIR:-$(cd "$(dirname "$0")" && pwd)}
 cd "$D" || exit 2
 mode=${1:-file}; run=${2:-1}
 SECONDS_CAP=${CAPTURE_SECONDS:-4.5}
-V1=(--source-kind test-audio --source-bundle-id afplay --start-bar 1 --pre-roll 1 --tail 1
+V1=(--source-kind test-audio --source-bundle-id com.apple.afplay --start-bar 1 --pre-roll 1 --tail 1
     --target-first 2 --target-last "${TARGET_LAST:-4}")
 APP=$D/ListenTapStream.app
 pgrep -f 'ListenTapStream.app/Contents/MacOS/listen-tap' >/dev/null && { echo '{"event":"refused","why":"spike already running"}' >&2; exit 3; }
