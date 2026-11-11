@@ -407,6 +407,16 @@ receipt with `reconciled`, the first cause and the Host's readback, and exits
 `reconcile_refused`. A VNC lane refuses with `reconcile_unsupported`, because
 its native process needs the reconciled broker restart.
 
+A VNC lane with Host capture can prove its release the same way when no VNC
+input it sent may still be held (TIN-5385). An input call is unsettled from
+its send until its own successful reply. Inside a hold scope only the
+confirmed `release_holds` settles it. A pointer move outside a hold scope
+presses nothing, so it is never unsettled. When the lane fails with its input
+settled, as on a missed Host receipt deadline for an AX call, the broker also
+waits for the VNC child to exit before the Host probe. A clean probe then
+releases the lane without a latch. A failure with unsettled input, or a VNC
+client that reports no exit, still answers `reconcile_unsupported`.
+
 ## Host input route
 
 A Host-only target whose profile sets `hostInput` lets FruitctlHost post the
