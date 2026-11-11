@@ -16,7 +16,8 @@ const mapping = { qualificationReceipt: 'test-fixture:explicit-geometry-proof', 
 const profile = () => ({ hostHelper: { ...hostBinding(), mapping } });
 
 /** A VNC client whose child exits on close. `hang(action)` leaves that
- * input unanswered. `exits: false` models a client without exit reporting. */
+ * input unanswered. `exits: false` models a client without exit reporting.
+ * `exits: 'manual'` reports an exit only when the test calls `exit()`. */
 function vncClient({ hang = () => false, exits = true } = {}) {
   let closeChild;
   const client = {
@@ -39,9 +40,10 @@ function vncClient({ hang = () => false, exits = true } = {}) {
       if (hang(action.action)) return new Promise(() => {});
       return actions.map(() => ({ id: 'native-input', result: { detail: 'input acknowledged' } }));
     },
-    async close(options) { client.closes.push(options); closeChild?.(); },
+    async close(options) { client.closes.push(options); if (exits !== 'manual') closeChild?.(); },
   };
   if (exits) client.closed = new Promise(resolve => { closeChild = resolve; });
+  if (exits === 'manual') client.exit = () => closeChild();
   return client;
 }
 
@@ -141,6 +143,7 @@ test('a settled VNC lane that latched on a busy Host is cleared by reconcile', a
     const receipt = await lane.reconcile();
     assert.equal(receipt.reconciled, true);
     assert.equal(receipt.host.lease_remaining_ms, 0);
+    assert.deepEqual(receipt.native, { input_settled: true, exit_observed: true, delivery_proven: false });
     assert.deepEqual(receipt.first_cause, { phase: 'host_helper', reason: 'deadline' });
     assert.equal(lane.cleanupFailure, undefined);
     lane.acquire('second');
@@ -159,5 +162,78 @@ test('a VNC client that cannot report its exit keeps the latch and reconcile_uns
     await assert.rejects(lane.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]));
     await assert.rejects(lane.release('first'), error => error.code === 'release_unconfirmed');
     await assert.rejects(lane.reconcile(), error => error.code === 'reconcile_unsupported');
+  } finally { await lane.close().catch(() => {}); }
+});
+
+test('a hold batch whose Host capture misses its deadline after mouse_down stays latched', async () => {
+  let captures = 0;
+  const hosts = hostSequence(index => ({ alter(request, response) {
+    // The capture before mouse_move never answers. mouse_down has replied,
+    // so a button may be down and no input call is in flight.
+    if (index === 0 && request.action === 'capture' && ++captures === 2) return null;
+    return response;
+  } }));
+  const client = vncClient();
+  const lane = laneFor(hosts, [client]);
+  try {
+    lane.acquire('first');
+    await assert.rejects(lane.execute([{ action: 'mouse_down', x: 10, y: 10 },
+      { action: 'mouse_move', x: 20, y: 20 }, { action: 'mouse_up', x: 20, y: 20 }], { timeoutMs: 1500 }));
+    assert.ok(client.calls.includes('mouse_down'));
+    assert.ok(!client.calls.includes('mouse_move'));
+    await assert.rejects(lane.release('first'), error => error.code === 'release_unconfirmed');
+    await assert.rejects(lane.reconcile(), error => error.code === 'reconcile_unsupported');
+    assert.equal(hosts.attachments.length, 1);
+  } finally { await lane.close().catch(() => {}); }
+});
+
+test('a hold batch whose release_holds never answers stays latched', async () => {
+  const hosts = hostSequence();
+  // Every input in the scope replied. Only release_holds settles the scope.
+  const lane = laneFor(hosts, [vncClient({ hang: action => action === 'release_holds' })]);
+  try {
+    lane.acquire('first');
+    await assert.rejects(lane.execute([{ action: 'mouse_down', x: 10, y: 10 },
+      { action: 'mouse_up', x: 10, y: 10 }], { timeoutMs: 1500 }));
+    await assert.rejects(lane.release('first'), error => error.code === 'release_unconfirmed');
+    await assert.rejects(lane.reconcile(), error => error.code === 'reconcile_unsupported');
+    assert.equal(hosts.attachments.length, 1);
+  } finally { await lane.close().catch(() => {}); }
+});
+
+test('a pointer move inside a hold scope is unsettled even before mouse_down', async () => {
+  const hosts = hostSequence();
+  const lane = laneFor(hosts, [vncClient({ hang: action => action === 'mouse_move' })]);
+  try {
+    lane.acquire('first');
+    await assert.rejects(lane.execute([{ action: 'mouse_move', x: 10, y: 10 },
+      { action: 'mouse_down', x: 10, y: 10 }, { action: 'mouse_up', x: 10, y: 10 }], { timeoutMs: 1500 }));
+    await assert.rejects(lane.release('first'), error => error.code === 'release_unconfirmed');
+    await assert.rejects(lane.reconcile(), error => error.code === 'reconcile_unsupported');
+  } finally { await lane.close().catch(() => {}); }
+});
+
+test('the proof waits for the VNC child to exit before any Host probe', async () => {
+  const hosts = hostSequence(index => ({ alter(request, response) {
+    return index === 0 && request.action === 'ax_action' ? null : response;
+  } }));
+  const client = vncClient({ exits: 'manual' });
+  const lane = laneFor(hosts, [client, vncClient()]);
+  try {
+    lane.acquire('first');
+    await lane.execute([{ action: 'ax_snapshot' }]);
+    await assert.rejects(lane.execute([{ action: 'click_element', ref: 'ax:77:0.0' }]));
+    // The child was signalled but has not exited within the release budget.
+    assert.ok(client.closes.length >= 1);
+    await assert.rejects(lane.release('first'), error => error.code === 'release_unconfirmed');
+    await assert.rejects(lane.reconcile({ timeoutMs: 500 }), /Native owned exit unconfirmed/);
+    assert.ok(lane.cleanupFailure);
+    assert.equal(hosts.attachments.length, 1);
+    // Once the child exits, the probe runs and the latch clears.
+    client.exit();
+    const receipt = await lane.reconcile();
+    assert.equal(receipt.reconciled, true);
+    assert.deepEqual(receipt.native, { input_settled: true, exit_observed: true, delivery_proven: false });
+    assert.deepEqual(hosts.attachments[1].requests.map(request => request.action), ['health']);
   } finally { await lane.close().catch(() => {}); }
 });

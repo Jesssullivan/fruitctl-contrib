@@ -417,6 +417,16 @@ waits for the VNC child to exit before the Host probe. A clean probe then
 releases the lane without a latch. A failure with unsettled input, or a VNC
 client that reports no exit, still answers `reconcile_unsupported`.
 
+The receipt for such a lane adds `native` with `input_settled`,
+`exit_observed` and `delivery_proven`. The last is always false. A settled
+call had its own reply from the VNC daemon, but RFB has no input
+acknowledgement, so that reply means only that the daemon wrote the bytes to
+its socket. The failure path also ends the daemon with a signal, without its
+shutdown handshake. A key-up still queued on that socket can be lost, and
+the proof would not see it. On a loopback tunnel this is unlikely. When a
+key or button seems stuck after a reconcile, check the target before the
+next session.
+
 ## Host input route
 
 A Host-only target whose profile sets `hostInput` lets FruitctlHost post the
