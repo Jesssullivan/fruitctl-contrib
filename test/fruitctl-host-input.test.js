@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { nativeFactory } from '../lib/broker/server.mjs';
 import { validateTargetTransport } from '../lib/broker/paths.mjs';
+import { normalizeHostCapturePolicy, normalizeHostInputPolicy } from '../lib/broker/host-helper.mjs';
 import { McpSession } from '../lib/mcp/server.js';
 import { isPreAdmissionRefusal } from '../lib/mcp/capabilities.js';
 import { hostOnlyProfile, hostSequence, refusal } from './host-mock.mjs';
@@ -249,4 +250,57 @@ test('a refusal after earlier text chunks posted reads back the partial input', 
     assert.equal(host.requests.filter(request => request.action === 'capture').length, 1);
     assert.equal(executor.failed, undefined);
   } finally { await executor.close(); }
+});
+
+// TIN-6327: `applications: "all"` admits input to any application. Every
+// other gate stays: the human Stop, the Host menu switch, and each typed
+// Host refusal (consent and system dialogs, secure input, the frontmost
+// check, operator input).
+test('applications "all" validates, needs an app per action and keeps every other gate', async () => {
+  const all = { applications: 'all' };
+  assert.equal(validateTargetTransport(hostOnlyProfile({ hostInput: { ...all, operatorInput: 'assert' } })), true);
+  for (const bad of ['*', 'ALL', 'any', ['*']]) {
+    assert.throws(() => validateTargetTransport(hostOnlyProfile({ hostInput: { applications: bad } })), /hostInput/);
+    assert.throws(() => normalizeHostInputPolicy({ applications: bad }), /hostInput/);
+  }
+  assert.equal(normalizeHostInputPolicy(all).applications, 'all');
+  // No list to default to, so capture keeps the display unless the operator names a list.
+  assert.deepEqual(normalizeHostCapturePolicy(undefined, normalizeHostInputPolicy(all)), { scope: 'display' });
+  assert.throws(() => normalizeHostCapturePolicy({ scope: 'target' }, normalizeHostInputPolicy(all)), /hostCapture/);
+  assert.deepEqual(normalizeHostCapturePolicy({ scope: 'target', applications: [LOGIC] }, normalizeHostInputPolicy(all)),
+    { scope: 'target', applications: [LOGIC] });
+
+  const { executor, host } = await executorFor({}, hostOnlyProfile({ hostInput: all }));
+  try {
+    const refused = code => error => isPreAdmissionRefusal(error) && error.code === code;
+    await assert.rejects(executor.execute([{ action: 'mouse_click', x: 1, y: 1 }]), refused('invalid_input'));
+    await assert.rejects(executor.execute([{ action: 'key_tap', key: 'a', app: 'not a bundle' }]),
+      refused('invalid_input'));
+    executor.humanStopLatched = true;
+    await assert.rejects(executor.execute([{ action: 'key_tap', key: 'a', app: 'org.gnu.Emacs' }]),
+      refused('human_stop_latched'));
+    executor.humanStopLatched = false;
+    executor.inputEnabled = false;
+    await assert.rejects(executor.execute([{ action: 'key_tap', key: 'a', app: 'org.gnu.Emacs' }]),
+      refused('input_disabled'));
+    executor.inputEnabled = true;
+    assert.deepEqual(inputs(host), []);
+    await executor.execute([{ action: 'key_tap', key: 'a', app: 'org.gnu.Emacs' }]);
+    await executor.execute([{ action: 'activate_app', app: 'com.apple.Terminal' }]);
+    assert.deepEqual(inputs(host).map(sent => sent.target.bundle_id), ['org.gnu.Emacs', 'com.apple.Terminal']);
+    // The display-scope capture names no include list.
+    const captures = host.requests.filter(request => request.action === 'capture');
+    assert.ok(captures.length > 0);
+    assert.ok(captures.every(request => request.params.include_bundle_ids === undefined));
+  } finally { await executor.close(); }
+
+  for (const reason of ['secure_input_active', 'input_target_mismatch', 'operator_input_detected',
+    'human_consent_required']) {
+    const { executor: refusing } = await executorFor({ answer: request => refusal(request, reason) },
+      hostOnlyProfile({ hostInput: all }));
+    try {
+      const [response] = await refusing.execute([{ action: 'mouse_click', x: 1, y: 1, app: 'org.gnu.Emacs' }]);
+      assert.equal(response.error.data.code, reason);
+    } finally { await refusing.close(); }
+  }
 });

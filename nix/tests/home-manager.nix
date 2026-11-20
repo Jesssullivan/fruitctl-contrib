@@ -71,6 +71,10 @@ let
     hostCapture.scope = "display";
     hostActivityIdleMs = 0;
   } // { nativePackage = fruitctlFlake.packages.aarch64-darwin.native-controller; })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
+  # "all" admits input to any application; capture then defaults to display scope.
+  hostOnlyAllDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly {
+    hostInput = { applications = "all"; operatorInput = "assert"; };
+  })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
   hostOnlyMinimalDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly { })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
   hostOnlyHelper = { sshHost = "fixture-mac"; command = [ "/Users/fruitctl-test/Applications/FruitctlHost.app/Contents/MacOS/FruitctlHost" "--stdio" ]; displayId = 1; };
   hostOnlyInlineDocument = (builtins.fromJSON (evaluate "aarch64-darwin" (hostOnly { hostHelperFile = null; hostHelper = hostOnlyHelper; })).home.file."Library/Application Support/fruitctl/config.json".text).targets.mac;
@@ -98,6 +102,8 @@ let
     { hostInput.applications = [ ]; }
     { hostInput.applications = [ "com.apple.logic10" "com.apple.logic10" ]; }
     { hostInput.applications = [ "not a bundle" ]; }
+    { hostInput.applications = "*"; }
+    { hostCapture.scope = "target"; hostInput.applications = "all"; }
     { hostCapture = { scope = "display"; applications = [ "com.apple.logic10" ]; }; }
     { hostCapture = { scope = "target"; exclude = [ "com.apple.logic10" ]; }; }
     { hostActivityIdleMs = 500; }
@@ -447,6 +453,10 @@ assert hostOnlyDocument == {
   hostCapture = { scope = "display"; };
   hostActivityIdleMs = 0;
 };
+assert hostOnlyAllDocument.hostInput == { applications = "all"; operatorInput = "assert"; };
+assert !(hostOnlyAllDocument ? hostCapture);
+assert !(rejected "aarch64-darwin" (hostOnly { hostInput.applications = "all"; hostCapture = { scope = "target"; applications = [ "com.apple.logic10" ]; }; }));
+assert !(rejected "aarch64-darwin" (hostOnly { hostInput.applications = "all"; hostCapture = { scope = "display"; exclude = [ "com.apple.logic10" ]; }; }));
 assert hostOnlyMinimalDocument == { transport = "host-only"; targetId = "fixture-mac"; hostHelperFile = "/Users/fruitctl-test/private/host-binding.json"; };
 assert hostOnlyInlineDocument.hostHelper.sshHost == "fixture-mac" && !(hostOnlyInlineDocument ? hostHelperFile) && !(hostOnlyInlineDocument ? vnc);
 assert hostOnlyBesideVnc.mac.transport == "host-only" && !(hostOnlyBesideVnc.mac ? daemonPath);
