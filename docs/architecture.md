@@ -433,6 +433,11 @@ one point is up to the plug-in; check the readback frame. The VNC route refuses 
   "hostInput": { "applications": ["com.apple.logic10"], "operatorInput": "yield", "operatorIdleMs": 1000 } }
 ```
 
+`"applications": "all"` admits input to any application. Each input action
+then names its `app`, a bundle identifier; an action without one is refused
+before admission as `invalid_input`. The Host gates in the table below apply
+unchanged. Only the first row, the operator list, is lifted.
+
 | Gate | Where | Refusal |
 | --- | --- | --- |
 | Operator policy names the app | broker | `input_target_not_allowed` |
@@ -579,7 +584,9 @@ outside the element's `AXMinValue` and `AXMaxValue` is not sent.
 ## Host capture scope
 
 Host captures leave out windows the agent should not see (#163). A Host-only
-target with `hostInput` captures only its input applications by default. Each
+target with a `hostInput` list captures only its input applications by
+default. With `"applications": "all"` the default is the display scope, and a
+target scope must name its own `applications`. Each
 image keeps the display's full geometry and every other window is black, so
 coordinates and AX frames map unchanged. The target's Save or Open panel
 service is kept with it. A display capture always leaves out FruitctlHost and a

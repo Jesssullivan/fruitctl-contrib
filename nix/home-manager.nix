@@ -171,7 +171,7 @@ let
         description = "Host-only input policy. Unset leaves the route observation-only.";
         type = lib.types.nullOr (lib.types.submodule {
           options = {
-            applications = lib.mkOption { type = lib.types.listOf lib.types.str; description = "Bundle identifiers the Host may send input to, 1 to 16 of them."; };
+            applications = lib.mkOption { type = lib.types.either (lib.types.enum [ "all" ]) (lib.types.listOf lib.types.str); description = "Bundle identifiers the Host may send input to, 1 to 16 of them, or \"all\" to admit input to any application. With \"all\" each input action names its app, and every other input gate still applies."; };
             operatorInput = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "yield" "assert" ]); default = null; description = "How the route treats local operator input. Unset keeps the broker default."; };
             operatorIdleMs = lib.mkOption { type = lib.types.nullOr (lib.types.ints.between 0 10000); default = null; description = "How long local operator input must be idle before agent input resumes, in milliseconds. Unset keeps the broker default."; };
           };
@@ -346,14 +346,15 @@ let
     && (target.hostHelperFile != null || target.hostHelper != null)
     && vncRouteUnset target
     && (target.hostHelper == null || target.hostHelper.mapping == null);
-  hostInputValid = policy: policy == null || bundleList policy.applications;
+  hostInputValid = policy: policy == null || policy.applications == "all" || bundleList policy.applications;
   # Target scope needs applications of its own or from hostInput, as the executor does.
   hostCaptureValid = target: let policy = target.hostCapture; in policy == null || (
     (policy.applications == null || bundleList policy.applications)
     && (policy.exclude == null || bundleList policy.exclude)
     && (policy.scope != "display" || policy.applications == null)
     && (policy.scope == "display" || policy.exclude == null)
-    && (policy.scope != "target" || policy.applications != null || target.hostInput != null));
+    && (policy.scope != "target" || policy.applications != null
+      || (target.hostInput != null && target.hostInput.applications != "all")));
   hostIdleValid = value: value == null || value == 0 || (value >= 1000 && value <= 600000);
   sameUuid = left: right: if left == null || right == null then left == right else lib.toUpper left == lib.toUpper right;
 in {
@@ -466,7 +467,7 @@ in {
         { assertion = builtins.all (name: let helper = cfg.targets.${name}.hostHelper; in helper == null || (builtins.match "[a-zA-Z0-9][]a-zA-Z0-9_.@:[-]{0,255}" helper.sshHost != null && builtins.length helper.command == 2 && absolute (builtins.head helper.command) && builtins.match "[^[:cntrl:]]*" (builtins.head helper.command) != null && lib.hasSuffix "/FruitctlHost" (builtins.head helper.command) && builtins.elemAt helper.command 1 == "--stdio" && (helper.displayId != null || helper.displayUuid != null) && (helper.displayId == null || helper.displayId > 0) && (helper.displayUuid == null || displayUuid helper.displayUuid))) targetNames; message = "Fruitctl hostHelper requires an SSH alias, [ /absolute/path/FruitctlHost --stdio ] command and a positive displayId or a displayUuid."; }
         { assertion = builtins.all (name: let target = cfg.targets.${name}; in !hostOnly target || hostOnlyValid target) targetNames; message = "A Host-only Fruitctl target requires Darwin, a targetId and a Host binding with no VNC mapping, and forbids VNC, credential, secret, native-client, input and clipboard settings."; }
         { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostOnly target || hostPolicyUnset target) targetNames; message = "Fruitctl hostInput, hostCapture and hostActivityIdleMs require the Host-only transport."; }
-        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostInputValid target.hostInput && hostCaptureValid target && hostIdleValid target.hostActivityIdleMs) targetNames; message = "Fruitctl Host policy requires 1 to 16 unique bundle identifiers, display scope for exclude only, applications for target scope, and hostActivityIdleMs of 0 or 1000 to 600000."; }
+        { assertion = builtins.all (name: let target = cfg.targets.${name}; in hostInputValid target.hostInput && hostCaptureValid target && hostIdleValid target.hostActivityIdleMs) targetNames; message = "Fruitctl Host policy requires 1 to 16 unique bundle identifiers or \"all\" for hostInput, display scope for exclude only, a bundle list for target scope, and hostActivityIdleMs of 0 or 1000 to 600000."; }
         { assertion = let ids = lib.filter (id: id != null) (map (name: cfg.targets.${name}.targetId) targetNames); in lib.unique ids == ids; message = "Fruitctl targetId values must be unique: use one profile per desktop."; }
         { assertion = builtins.all (name: cfg.targets.${name}.clipboard.ttlMs == null || cfg.targets.${name}.clipboard.read) targetNames; message = "Fruitctl clipboard.ttlMs requires clipboard.read."; }
         { assertion = builtins.all (name: sshDestination cfg.targets.${name}.wake.ssh && sshDestination cfg.targets.${name}.desktopState.ssh) targetNames; message = "Fruitctl wake.ssh and desktopState.ssh must be explicit user@host destinations or SSH aliases, not options or shell text."; }

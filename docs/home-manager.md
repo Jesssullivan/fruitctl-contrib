@@ -447,7 +447,9 @@ programs.fruitctl.targets.desk = {
 ```
 
 `hostInput` lists the applications the Host may send input to. Without it the
-route is observation-only. `hostCapture` and `hostActivityIdleMs` are optional,
+route is observation-only. `applications = "all"` admits input to any
+application. Each input action then names its `app`, every Host gate still
+applies, and captures default to the display scope. `hostCapture` and `hostActivityIdleMs` are optional,
 and an unset field keeps the broker default. See
 [Host input](architecture.md) for the gates and policy values.
 
