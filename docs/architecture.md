@@ -674,6 +674,13 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `bridge_protocol`, `bridge_lost`, `bridge_unconfirmed` | relay | The bridge failed with work in flight; nothing is replayed |
 | `relay_config`, `relay_listener_failed` | relay | The relay could not start |
 
+After a `broker_unavailable` or a `bridge_*` code other than
+`bridge_unconfirmed`, the client's next execute opens one new connection with a
+short connect timeout. It never retries in the background and never resends a
+request from the lost connection. The new connection is a new session with no
+lease. `bridge_unconfirmed`, `release_unconfirmed` and protocol failures keep
+the client failed until the operator reconnects it.
+
 "Host route" is the broker's host-helper executor; "Host" is FruitctlHost
 itself. A string code raised by the broker before admission (lane, secret,
 clipboard, sentinel or a Host route check) means nothing was sent and the

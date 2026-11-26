@@ -335,9 +335,17 @@ The classified causes are `bridge_unreachable`, with reason `dns`, `refused`,
 `bridge_protocol` and `bridge_broker_unavailable`. They come from SSH's exit
 status and stderr, which is read only on the seat: its text never reaches a
 client, the journal or a log line. The agent's MCP result carries the same
-code in `error.code`, both for a call in flight and for every later call on
-that MCP session; the session does not reopen itself, so reconnect it (in
-Claude Code, `/mcp`) once the relay reports `up`.
+code in `error.code` for a call in flight. The client never reconnects in the
+background. The next call opens one new relay connection with a short connect
+timeout, and a call that fails there gets that attempt's own code. Work in
+flight on the lost connection is never sent again. The new connection is a new
+broker session: the broker released the old lease when the old connection
+closed, and input waits for a new screenshot. A release (`task_complete` or
+`task_failed`) does not reconnect, because a new session cannot prove the old
+lease was released; it reports the loss. `bridge_unconfirmed`,
+`release_unconfirmed`, a protocol violation or an unknown profile keep the MCP
+session failed. Reconcile the target first, then reconnect the server (in
+Claude Code, `/mcp`).
 
 Two exit statuses tell systemd not to restart the relay. Status 3 means the
 relay could not confirm that a lost SSH child exited; reconcile the target

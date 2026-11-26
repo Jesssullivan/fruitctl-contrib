@@ -290,8 +290,9 @@ for (const kind of ['execute', 'release']) {
     const emitted = deferred();
     const frames = [];
     const client = Object.create(BrokerExecutor.prototype);
-    Object.assign(client, { pending: new Map(), opened: Promise.resolve(), closed: false,
-      rejectOpen() {}, socket: { writableLength: 0, write(line) { frames.push(JSON.parse(line)); emitted.resolve(); }, destroy() {} } });
+    // TIN-8604: one broker connection is one channel; nothing reconnects here.
+    Object.assign(client, { reconnect: false, channel: { pending: new Map(), opened: Promise.resolve(), closed: false,
+      rejectOpen() {}, socket: { writableLength: 0, write(line) { frames.push(JSON.parse(line)); emitted.resolve(); }, destroy() {} } } });
     const request = kind === 'execute' ? client.execute([{ action: 'wait' }], { timeoutMs: 20 }) : client.release({ timeoutMs: 20 });
     const rejected = assert.rejects(request, kind === 'release' ? /release unconfirmed.*deadline/i : /deadline/);
     now += 5; // Opening consumed five milliseconds, not a new request budget.
