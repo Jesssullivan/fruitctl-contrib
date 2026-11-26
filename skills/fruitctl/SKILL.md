@@ -68,12 +68,14 @@ From a Linux seat the MCP server reaches the Mac through an SSH relay. Codes
 while work may have been in flight: input was not replayed, and whether it ran
 is unknown, so take a screenshot before repeating anything. Any other
 `bridge_*` code, or `broker_unavailable`, means the request was not
-delivered. After a dropped link the next call opens one new connection. It is
-a new session: it holds no lease, so take a screenshot before any input. If
+delivered. After `bridge_lost`, any other not-delivered code or a plain
+"execution is uncertain" close, the next call opens one new connection. It is
+a new session and holds no lease. A VNC route refuses input until a screenshot
+succeeds. A Host route does not, so take a screenshot before any input. If
 that call fails too, report the code and wait; do not retry in a loop.
-`bridge_unconfirmed`, `release_unconfirmed` or an untyped `Broker executor
-closed` keep the session failed: report it and ask the operator, who
-reconciles the target or reconnects the server.
+`bridge_protocol`, `bridge_unconfirmed`, `release_unconfirmed` or an untyped
+`Broker executor closed` keep the session failed: report it and ask the
+operator, who reconciles the target or reconnects the server.
 
 Inspect the current
 image and its scaled coordinates, perform authorized bounded input, and obtain

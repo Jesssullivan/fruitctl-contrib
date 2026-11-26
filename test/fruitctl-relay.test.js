@@ -248,7 +248,7 @@ test('a bridge loss reaches the agent as a typed MCP code; a later call reconnec
   assert.notEqual(answered.isError, true);
 });
 
-test('broker_unavailable is reserved for a socket that never connected', async t => {
+test('broker_unavailable is reserved for a connection that never opened', async t => {
   const root = await directory(t);
   const absent = new BrokerExecutor({ socketPath: path.join(root, 'absent.sock'), target: 'desktop' });
   await assert.rejects(absent.opened, error => error.code === 'broker_unavailable');

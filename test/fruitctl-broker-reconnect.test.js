@@ -2,7 +2,7 @@
 // TIN-8604: after its relay connection drops, the broker client opens a new
 // connection on the next execute, once, and never replays work that may have
 // reached the broker. A reconnected client is a new broker session: no lease,
-// and input waits for a new screenshot.
+// and on VNC routes the new executor refuses input until a screenshot.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
@@ -36,8 +36,9 @@ async function waitUntil(predicate, message, timeoutMs = 2000) {
 // connection records its frames; the test answers or drops it.
 async function fakeRelay(t, socketPath, { answer = true } = {}) {
   const connections = [];
+  const api = { connections, holdNew: false };
   const server = net.createServer(socket => {
-    const connection = { socket, frames: [] };
+    const connection = { socket, frames: [], hold: api.holdNew };
     connections.push(connection);
     readFrames(socket, frame => {
       connection.frames.push(frame);
@@ -56,7 +57,7 @@ async function fakeRelay(t, socketPath, { answer = true } = {}) {
     server.close(resolve);
   });
   t.after(close);
-  return { connections, close };
+  return Object.assign(api, { close });
 }
 
 const executes = connection => connection.frames.filter(frame => frame.kind === 'execute');
@@ -188,14 +189,14 @@ test('release and reconcile never reconnect after a drop', TEST_TIMEOUT, async t
   assert.equal(relay.connections.length, 1);
 });
 
-for (const code of ['bridge_unconfirmed', 'release_unconfirmed']) {
+for (const code of ['bridge_unconfirmed', 'bridge_protocol', 'release_unconfirmed']) {
   test(`${code} keeps the session failed for the operator`, TEST_TIMEOUT, async t => {
     const socketPath = path.join(await directory(t), 'relay.sock');
     const relay = await fakeRelay(t, socketPath);
     const executor = new BrokerExecutor({ socketPath, target: 'desktop' });
     t.after(() => executor.close());
     await executor.opened;
-    if (code === 'bridge_unconfirmed') {
+    if (code !== 'release_unconfirmed') {
       writeFrame(relay.connections[0].socket, { v: 1, kind: 'error', error: { code, message: 'unconfirmed' } });
       relay.connections[0].socket.end();
     } else {
@@ -240,7 +241,10 @@ test('a protocol violation, an unknown profile and an explicit close never recon
 
 // The real broker binds a lease to one connection. A proxy stands in for the
 // relay so the test can drop the client side while the broker stays up.
-test('after a reconnect the broker gives a new session: no lease, input waits for a screenshot', TEST_TIMEOUT, async t => {
+// Only VNC routes refuse input before a screenshot, in the native daemon; the
+// factory below copies that rule. A Host-only route reads the display from
+// health and accepts input at once, so there the agent takes the screenshot.
+test('after a reconnect the broker gives a new session: old lease released, new executor started', TEST_TIMEOUT, async t => {
   const root = await directory(t);
   const brokerSocket = path.join(root, 'broker.sock');
   const relaySocket = path.join(root, 'relay.sock');
@@ -296,7 +300,7 @@ test('after a reconnect the broker gives a new session: no lease, input waits fo
   await waitUntil(() => executors[0].closed, 'the broker releases the dropped lease and closes its executor');
 
   const refused = await executor.execute([{ action: 'left_click', x: 5, y: 5 }]);
-  assert.equal(refused[0].error.code, -32011, 'input after reconnect waits for a screenshot');
+  assert.equal(refused[0].error.code, -32011, 'a new executor starts with no observation (VNC daemon rule, copied)');
   assert.equal(executors.length, 2, 'the new session has a new executor');
   assert.deepEqual(executors[1].input, []);
   await executor.execute([{ action: 'screenshot' }]);
@@ -328,4 +332,49 @@ test('the MCP session drops display and capability metadata from an earlier conn
   assert.deepEqual(session.display, { width: null, height: null });
   assert.equal(session.capabilities, undefined);
   assert.equal(session.generation, 2);
+});
+
+test('a connection that closes before it opens fails as not delivered and the next call reconnects', TEST_TIMEOUT, async t => {
+  const socketPath = path.join(await directory(t), 'relay.sock');
+  const relay = await fakeRelay(t, socketPath, { answer: false });
+  const executor = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => executor.close());
+  await waitUntil(() => relay.connections.length === 1 && relay.connections[0].frames.length === 1, 'open sent');
+  relay.connections[0].socket.end();
+  await assert.rejects(executor.opened, error => error.code === 'broker_unavailable' && /not delivered/.test(error.message));
+  assert.deepEqual(relay.connections[0].frames.map(frame => frame.kind), ['open'], 'nothing but open was sent');
+
+  const call = executor.execute([{ action: 'health' }], { timeoutMs: 5000 });
+  await waitUntil(() => relay.connections.length === 2 && relay.connections[1].frames.length === 1, 'reopen');
+  writeFrame(relay.connections[1].socket, { v: 1, kind: 'opened', clientId: 'b' });
+  await waitUntil(() => relay.connections[1].frames.length === 2, 'execute');
+  const { id } = relay.connections[1].frames[1];
+  writeFrame(relay.connections[1].socket, { v: 1, kind: 'result', id, responses: [{ result: { detail: 'health' } }] });
+  assert.equal((await call)[0].result.detail, 'health');
+});
+
+test('each connection keeps its own pending list; the old one cannot settle or fail a new request', TEST_TIMEOUT, async t => {
+  const socketPath = path.join(await directory(t), 'relay.sock');
+  const relay = await fakeRelay(t, socketPath);
+  const executor = new BrokerExecutor({ socketPath, target: 'desktop' });
+  t.after(() => executor.close());
+  await executor.opened;
+  const old = executor.channel;
+  relay.connections[0].socket.destroy();
+  await waitUntil(() => executor.closed, 'drop seen');
+
+  relay.holdNew = true;
+  const call = executor.execute([{ action: 'health' }], { timeoutMs: 5000 });
+  await waitUntil(() => relay.connections.length === 2 && executes(relay.connections[1]).length === 1,
+    'execute on the new connection');
+  const { id } = executes(relay.connections[1])[0];
+  assert.notStrictEqual(executor.pending, old.pending);
+  assert.equal(old.pending.size, 0);
+  assert.equal(executor.pending.size, 1);
+  // A late frame or failure attributed to the old connection changes nothing.
+  executor.receive({ v: 1, kind: 'result', id, responses: [{ result: { detail: 'stale' } }] }, old);
+  executor.fail(new Error('late failure on the old connection'), old);
+  assert.equal(executor.pending.size, 1);
+  writeFrame(relay.connections[1].socket, { v: 1, kind: 'result', id, responses: [{ result: { detail: 'health' } }] });
+  assert.equal((await call)[0].result.detail, 'health');
 });

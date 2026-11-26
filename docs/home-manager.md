@@ -340,11 +340,13 @@ background. The next call opens one new relay connection with a short connect
 timeout, and a call that fails there gets that attempt's own code. Work in
 flight on the lost connection is never sent again. The new connection is a new
 broker session: the broker released the old lease when the old connection
-closed, and input waits for a new screenshot. A release (`task_complete` or
-`task_failed`) does not reconnect, because a new session cannot prove the old
-lease was released; it reports the loss. `bridge_unconfirmed`,
-`release_unconfirmed`, a protocol violation or an unknown profile keep the MCP
-session failed. Reconcile the target first, then reconnect the server (in
+closed and starts a new executor. On a VNC route that executor refuses input
+until a screenshot succeeds. A Host-only route reads the display from `health`
+and accepts input at once, so the agent takes a screenshot before acting. A
+release (`task_complete` or `task_failed`) does not reconnect, because a new
+session cannot prove the old lease was released; it reports the loss.
+`bridge_protocol`, `bridge_unconfirmed`, `release_unconfirmed`, an invalid
+broker frame or an unknown profile keep the MCP session failed. Reconcile the target first, then reconnect the server (in
 Claude Code, `/mcp`).
 
 Two exit statuses tell systemd not to restart the relay. Status 3 means the
