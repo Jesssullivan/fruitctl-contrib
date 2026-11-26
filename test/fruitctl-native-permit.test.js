@@ -252,6 +252,12 @@ test('helper native challenges renew during a long input, bind the full allocati
   const owned = await fixture(t);
   const executor = await owned.host();
   await executor.execute([{ action: 'key_type', text: 'synthetic-only' }], { timeoutMs: 2500 });
+  // The heartbeat keeps renewing after the input returns. A renewal caught
+  // between its begin and its grant would leave one begin unpaired, so read
+  // the events after release, which finishes any permit control in flight
+  // and then stops the native executor.
+  await executor.release({ timeoutMs: 1000 });
+  assert.equal(executor.released, true);
   const events = await owned.events();
   const start = events.findIndex(event => event.event === 'native-input-start');
   const end = events.findIndex(event => event.event === 'native-input-end');
@@ -276,8 +282,6 @@ test('helper native challenges renew during a long input, bind the full allocati
     if (index) assert.ok(begin.sequence > begins[index - 1].params.sequence);
   }
   assert.ok(!events.some(event => event.event === 'native-expired' || event.event === 'forbidden-raw-capture'));
-  await executor.release({ timeoutMs: 1000 });
-  assert.equal(executor.released, true);
   assert.equal(owned.native.shutdownAcknowledged, true);
   assert.equal(owned.native.child.exitCode, 0);
 });
