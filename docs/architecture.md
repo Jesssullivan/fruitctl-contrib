@@ -669,10 +669,20 @@ in `lib/`, `ClaudeKVM-Daemon/` or `FruitctlHost/` that is missing. `-32001` to
 | `reconcile_refused` | broker | `fruitctl reconcile` found the lane closing, busy or changed |
 | `reconcile_unsupported` | broker | The latched lane cannot prove its own release; restart the reconciled broker |
 | `operation_failed` | broker | Any other error crossing the broker socket |
-| `broker_unavailable` | client | The broker socket is not reachable |
+| `broker_unavailable` | client | The broker socket is not reachable, or the connection ended before the session opened; nothing was delivered |
 | `bridge_unreachable`, `bridge_auth_refused`, `bridge_host_key`, `bridge_command_missing`, `bridge_attach_failed`, `bridge_broker_unavailable` | relay | The SSH bridge (D20) did not deliver the request |
 | `bridge_protocol`, `bridge_lost`, `bridge_unconfirmed` | relay | The bridge failed with work in flight; nothing is replayed |
 | `relay_config`, `relay_listener_failed` | relay | The relay could not start |
+
+After `broker_unavailable`, a `bridge_*` code other than `bridge_protocol` and
+`bridge_unconfirmed`, or an untyped close after the session opened, the
+client's next execute opens one new connection with a short connect timeout.
+It never retries in the background and never resends a request from the lost
+connection. The new connection is a new session with no lease. Its new
+executor refuses input until a screenshot on a VNC route; a Host-only route
+does not, so the agent takes one first. `bridge_protocol`,
+`bridge_unconfirmed`, `release_unconfirmed` and invalid broker frames keep the
+client failed until the operator reconnects it.
 
 "Host route" is the broker's host-helper executor; "Host" is FruitctlHost
 itself. A string code raised by the broker before admission (lane, secret,

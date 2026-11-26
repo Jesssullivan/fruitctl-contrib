@@ -209,8 +209,8 @@ test('losing an answered link fails in-flight work as uncertain and never replay
   assert.deepEqual(children[1].packets, [], 'the uncertain click is not replayed');
 });
 
-test('a bridge loss reaches the agent as a typed MCP code, in flight and on every later call', async t => {
-  const { socketPath, children } = await supervisedRelay(t);
+test('a bridge loss reaches the agent as a typed MCP code; a later call reconnects once without replay', async t => {
+  const { relay, socketPath, children } = await supervisedRelay(t);
   const executor = openExecutor(socketPath);
   await waitUntil(() => children[0].packets.length === 1, 'open forwarded');
   children[0].reply(children[0].packets[0].channel, { v: 1, kind: 'opened', clientId: 'fixture' });
@@ -224,15 +224,31 @@ test('a bridge loss reaches the agent as a typed MCP code, in flight and on ever
   assert.equal(inFlight.isError, true);
   assert.equal(inFlight.structuredContent.error.code, 'bridge_lost');
 
-  // The session does not reopen; its next call names the same cause instead
-  // of an untyped "closed", and nothing reaches any link.
+  // TIN-8604: the next call opens one new relay connection. While the bridge
+  // is still down the relay answers it at once as not delivered.
   const later = await session.command({ action: 'screenshot' });
-  assert.equal(later.structuredContent.error.code, 'bridge_lost');
-  assert.match(later.structuredContent.error.message, /uncertain/);
+  assert.equal(later.structuredContent.error.code, 'bridge_unreachable');
+  assert.match(later.structuredContent.error.message, /not delivered/);
   assert.equal(children[0].packets.length, 2);
+
+  // Once the bridge is back, a later call is a new session on the new link.
+  await waitUntil(() => children.length === 2, 'successor spawned');
+  children[1].hello();
+  await waitUntil(() => relay.health().state === 'up', 'successor up');
+  const reopened = session.command({ action: 'screenshot' });
+  await waitUntil(() => children[1].packets.length === 1, 'open on the new link');
+  assert.equal(children[1].packets[0].packet.kind, 'open');
+  children[1].reply(children[1].packets[0].channel, { v: 1, kind: 'opened', clientId: 'fixture-2' });
+  await waitUntil(() => children[1].packets.length === 2, 'execute on the new link');
+  const sent = children[1].packets[1].packet;
+  assert.deepEqual(sent.actions.map(action => action.action), ['screenshot'], 'the lost wait is not replayed');
+  children[1].reply(children[1].packets[1].channel, { v: 1, kind: 'result', id: sent.id,
+    responses: [{ result: { detail: 'screenshot' } }] });
+  const answered = await reopened;
+  assert.notEqual(answered.isError, true);
 });
 
-test('broker_unavailable is reserved for a socket that never connected', async t => {
+test('broker_unavailable is reserved for a connection that never opened', async t => {
   const root = await directory(t);
   const absent = new BrokerExecutor({ socketPath: path.join(root, 'absent.sock'), target: 'desktop' });
   await assert.rejects(absent.opened, error => error.code === 'broker_unavailable');
